@@ -374,4 +374,15 @@ Bun.serve({
     return page(req, url)
   },
 })
+// keep the home page's queries warm (same keys the client builds) so nobody waits after a deploy
+const HOT: [string, unknown][] = [
+  ['bounties.fetchAll', { status: 'open', sortType: 'value', limit: 12 }], ['claims.fetchLatest', { limit: 15 }],
+  ['claims.fetchRecentPayouts', { limit: 12 }], ['web3.fetchPrice', { currency: 'eth' }], ['accounts.activities', { limit: 20 }],
+]
+const warmHome = () => {
+  for (const [proc, input] of HOT)
+    fetchInto(`/api/trpc/${proc}?batch=1&input=${encodeURIComponent(JSON.stringify({ 0: { json: input } }))}`, new Request(UPSTREAM)).catch(() => {})
+}
+warmHome()
+setInterval(warmHome, 60_000)
 console.log(`poidh on :${PORT} → ${UPSTREAM}`)
