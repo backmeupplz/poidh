@@ -74,7 +74,7 @@ async function hydratePeople(root = app) {
   unnamed.forEach((a) => names.set(a, null))
   await Promise.all(unnamed.map((a) => q('web3.fetchHumanReadableName', { address: a }).then((n) => n && names.set(a, n), () => {})))
   for (const el of $$('[data-name]', root)) if (people.get(el.dataset.name) || names.get(el.dataset.name)) el.textContent = nameOf(el.dataset.name)
-  for (const el of $$('[data-who]', root)) if (people.get(el.dataset.who) || names.get(el.dataset.who)) el.innerHTML = avatar(el.dataset.who) + (el.dataset.only ? '' : `<span class="ellipsis">${esc(nameOf(el.dataset.who))}</span>`)
+  for (const el of $$('[data-who]', root)) if (people.get(el.dataset.who) || names.get(el.dataset.who)) el.innerHTML = avatar(el.dataset.who, el.dataset.cls || 'av') + (el.dataset.only ? '' : `<span class="ellipsis">${esc(nameOf(el.dataset.who))}</span>`)
 }
 
 // --- claim media: claim.url is metadata json, an image or a video ------------
@@ -164,7 +164,7 @@ function bountyCard(b, usdPrice) {
   const amt = fmtEth(b.amount)
   const badges = [
     b.isMultiplayer && '<span class="badge">open bounty</span>',
-    b.isVoting && '<span class="badge red">voting</span>',
+    b.isVoting && b.inProgress && '<span class="badge red">voting</span>',
     b.isCanceled && '<span class="badge">cancelled</span>',
     !b.inProgress && !b.isCanceled && '<span class="badge green">paid out</span>',
     b.hasClaims && b.inProgress && '<span class="badge">has claims</span>',
@@ -174,7 +174,8 @@ function bountyCard(b, usdPrice) {
     <h3>${esc(b.title)}</h3>
     <div class="desc">${esc(plain(b.description).slice(0, 400))}</div>
     ${badges ? `<div class="badges">${badges}</div>` : ''}
-    <div class="foot"><span class="amount">${amt} ${unit(b.chainId)} ${usdPrice ? `<small>(${fmtUsd((Number(BigInt(b.amount)) / 1e18) * usdPrice)})</small>` : ''}</span>${chainDot(b.chainId)}</div>
+    ${b.acceptedClaim?.url ? `<div class="winner"><div class="thumb" data-media data-src="${esc(b.acceptedClaim.url)}" data-alt=""></div><span class="ellipsis"><span class="dim">winner</span> ${esc(b.acceptedClaim.title)}</span></div>` : ''}
+    <div class="foot"><span class="amount">${amt} ${unit(b.chainId)}${usdPrice ? ` <small>${fmtUsd((Number(BigInt(b.amount)) / 1e18) * usdPrice)}</small>` : ''}</span><span class="row dim" style="font-size:11px;gap:6px">${chainDot(b.chainId)}${chainOf(b.chainId).label}</span></div>
   </a>`
 }
 
@@ -347,6 +348,7 @@ async function home(params) {
     <section class="hero">
       <h1>social bounties for <em id="word">fun</em></h1>
       <p>post a bounty with eth, anyone can claim it with a pic. pics or it didn't happen.</p>
+      <div class="hero-cta"><a class="btn red" href="/create">create a bounty</a><button class="btn" id="how">how it works</button></div>
     </section>
     <div class="sec"><h2>latest claims</h2></div>
     <div id="latest">${skelStrip()}</div>
@@ -360,6 +362,7 @@ async function home(params) {
   let w = 0
   const id = renderId
   const spin = setInterval(() => (id !== renderId ? clearInterval(spin) : ($('#word') && ($('#word').textContent = WORDS[++w % WORDS.length]))), 2200)
+  $('#how').onclick = howItWorks
   $('#sort').onchange = (e) => go(`/?tab=${tab}${e.target.value === 'date' ? '&sort=date' : ''}`, true)
   const p = await price()
   infinite($('#bounties'), (cursor) => q('bounties.fetchAll', { status: tab, sortType: sort, limit: 12, ...(cursor ? { cursor } : {}) }), (items) => items.map((b) => bountyCard(b, p)).join(''), tab === 'progress' ? 'no votes running right now' : 'no bounties here yet')
@@ -472,6 +475,14 @@ async function bountyPage(slug, dbId, params) {
   $('#actions').innerHTML = actions.map(([l, c], i) => `<button class="btn block ${c}" data-a="${i}">${l}</button>`).join('') || (b.inProgress ? '' : '')
   $$('[data-a]').forEach((btn) => (btn.onclick = () => actions[btn.dataset.a][2](btn)))
   $('#claim2')?.addEventListener('click', () => claimForm(b))
+  if (b.inProgress && !chain.retired) {
+    app.insertAdjacentHTML('beforeend', `<div class="claimbar only-mobile"><div><b>${fmtEth(b.amount)} ${unit(chainId)}</b><span class="dim">${p ? fmtUsd(eth * p) : ''}</span></div><button class="btn red" id="claim3">submit a claim</button></div>`)
+    $('#claim3').onclick = () => claimForm(b)
+    // only once the panel's own button has scrolled away
+    const bar = $('.claimbar')
+    bar.hidden = true
+    new IntersectionObserver(([e]) => (bar.hidden = e.isIntersecting || e.boundingClientRect.top > 0)).observe($('#actions'))
+  }
   $('#share').onclick = () => share(b.title, location.origin + location.pathname)
 
   $('#history').addEventListener('toggle', async (e) => {
@@ -643,6 +654,18 @@ async function renderVote(b, v, parts) {
     done('vote resolved')
     reload()
   }))
+}
+
+function howItWorks() {
+  const d = sheet(`<h2>how poidh works</h2>
+    <ol class="steps">
+      <li><b>post a bounty</b><span>describe what you want to see and lock eth in the poidh contract. solo bounties are yours to judge; open bounties let anyone add funds.</span></li>
+      <li><b>people claim it</b><span>anyone can submit a pic or video as proof. every claim is minted as an nft.</span></li>
+      <li><b>pick the winner</b><span>the issuer accepts the best claim and the eth goes to its creator. if others added funds, contributors vote for 48 hours, weighted by what they put in.</span></li>
+      <li><b>withdraw</b><span>winnings and refunds wait in the contract until you withdraw them from your profile. poidh takes 2.5% of payouts.</span></li>
+    </ol>
+    <a class="btn red block" href="/create">create a bounty</a>`)
+  $$('a', d).forEach((a) => a.addEventListener('click', () => d.close()))
 }
 
 function confirmSheet(title, text, yes, fn) {
@@ -923,15 +946,35 @@ async function ownerBox(addr) {
 
 async function leaderboard(params) {
   const page = Math.max(1, +params.get('page') || 1)
-  app.innerHTML = `<h1 class="page-title">leaderboard</h1><p class="lead">poidh score = eth earned and paid out, plus claims collected.</p><div class="panel" id="lb"><div class="skel" style="height:400px"></div></div>`
-  const r = await q('leaderboard.fetch', { page, limit: 10, ...(state.account ? { userAddress: state.account } : {}) }).catch(() => null)
+  app.innerHTML = `<h1 class="page-title">leaderboard</h1><p class="lead">the top 100 on poidh. score = eth earned and paid out × 1000, plus 10 per claim collected.</p>
+    <div id="me"></div><div id="podium"></div><div class="lb-list" id="lb">${'<div class="skel" style="height:64px"></div>'.repeat(page === 1 ? 7 : 10)}</div><div id="pages"></div>`
+  if (page === 1) $('#podium').innerHTML = `<div class="podium">${'<div class="skel" style="height:220px"></div>'.repeat(3)}</div>`
+  const [r, top] = await Promise.all([
+    q('leaderboard.fetch', { page, limit: 10, ...(state.account ? { userAddress: state.account } : {}) }).catch(() => null),
+    page === 1 ? null : q('leaderboard.fetch', { page: 1, limit: 10 }).catch(() => null),
+  ])
   if (!r) return ($('#lb').innerHTML = '<div class="empty">could not load the leaderboard</div>')
-  const row = (rank, [a, s], me) => `<tr${me ? ' style="background:var(--glass-2)"' : ''}><td class="dim">${rank}</td><td>${who(a)}</td><td class="n">${s.total.toLocaleString()}</td></tr>`
-  $('#lb').innerHTML = `<table class="lb"><thead><tr><th>#</th><th>who</th><th style="text-align:right">score</th></tr></thead><tbody>
-    ${r.userData ? row(r.userData.rank, r.userData.data, true) : ''}
-    ${r.leaderboard.map((x, i) => row((page - 1) * 10 + i + 1, x, lc(x[0]) === state.account)).join('')}</tbody></table>
-    <div class="row between" style="margin-top:12px">${r.pagination.hasPreviousPage ? `<a class="btn sm" href="?page=${page - 1}">← prev</a>` : '<span></span>'}<span class="dim">${page} / ${r.pagination.totalPages}</span>${r.pagination.hasNextPage ? `<a class="btn sm" href="?page=${page + 1}">next →</a>` : '<span></span>'}</div>`
-  hydratePeople($('#lb'))
+  const best = (top || r).leaderboard[0]?.[1].total || 1
+  const chains = (s) => [['base', s.base], ['arbitrum', s.arbitrum], ['ethereum', s.mainnet], ['degen', s.degen]].filter(([, v]) => v > 0)
+    .map(([c, v]) => `<span title="${c}">${chainDot(BY_SLUG[c === 'ethereum' ? 'mainnet' : c].id)} ${v.toLocaleString()}</span>`).join('')
+  const row = (rank, [a, s], me = false) => `<a class="lb-row${me ? ' me' : ''}" href="/account/${esc(lc(a))}" style="--w:${Math.max(2, (s.total / best) * 100)}%">
+    <span class="rank">${rank}</span><span data-who="${esc(lc(a))}" data-only="av">${avatar(a)}</span>
+    <span class="grow"><span class="nm ellipsis" data-name="${esc(lc(a))}">${esc(nameOf(a))}</span><span class="chains">${chains(s)}</span></span>
+    <span class="score">${s.total.toLocaleString()}</span></a>`
+  const list = r.leaderboard.map((x, i) => [(page - 1) * 10 + i + 1, x])
+  if (page === 1) {
+    const medal = ['🥇', '🥈', '🥉']
+    $('#podium').innerHTML = `<div class="podium">${list.slice(0, 3).map(([rank, [a, s]], i) => `
+      <a class="step s${rank}" href="/account/${esc(lc(a))}">
+        <span class="medal">${medal[i]}</span><span data-who="${esc(lc(a))}" data-only="av" data-cls="av xl">${avatar(a, 'av xl')}</span>
+        <b class="ellipsis" data-name="${esc(lc(a))}">${esc(nameOf(a))}</b><span class="score">${s.total.toLocaleString()}</span><span class="chains">${chains(s)}</span>
+      </a>`).join('')}</div>`
+  }
+  $('#lb').innerHTML = list.slice(page === 1 ? 3 : 0).map(([rank, x]) => row(rank, x, lc(x[0]) === state.account)).join('')
+  if (r.userData && !list.some(([, x]) => lc(x[0]) === state.account)) $('#me').innerHTML = `<div class="sec" style="margin-top:0"><h2>you</h2></div>${row(r.userData.rank, r.userData.data, true)}`
+  const n = r.pagination.totalPages
+  $('#pages').innerHTML = `<nav class="pages">${page > 1 ? `<a class="btn sm" href="?page=${page - 1}" aria-label="previous page">←</a>` : ''}${Array.from({ length: n }, (_, i) => `<a class="btn sm${i + 1 === page ? ' on' : ''}" href="?page=${i + 1}">${i + 1}</a>`).join('')}${page < n ? `<a class="btn sm" href="?page=${page + 1}" aria-label="next page">→</a>` : ''}</nav>`
+  hydratePeople(app)
 }
 
 async function album(name, params) {
@@ -1079,7 +1122,7 @@ async function route(params) {
   $$('.more').forEach((x) => x.remove())
   const path = location.pathname.replace(/\/+$/, '') || '/'
   params ||= new URLSearchParams(location.search)
-  $$('[data-nav]').forEach((a) => a.classList.toggle('on', (a.dataset.nav === 'home' && path === '/') || path === '/' + a.dataset.nav))
+  $$('[data-nav]').forEach((a) => a.classList.toggle('on', (a.dataset.nav === 'home' && path === '/') || path === '/' + a.dataset.nav || (a.dataset.nav === 'me' && !!state.account && path === '/account/' + state.account)))
   $('.create-btn').classList.toggle('hide', path === '/create')
   state.mini?.setBack(depth > 0)
   let m
@@ -1092,6 +1135,12 @@ async function route(params) {
     if ((m = path.match(/^\/account\/([^/]+)$/))) return await account(m[1])
     if ((m = path.match(/^\/a\/([^/]+)$/))) return await album(m[1], params)
     if (path === '/create') return await create()
+    if (path === '/me') {
+      if (!state.account) await connect().catch(() => {})
+      if (state.account) return go('/account/' + state.account, true)
+      app.innerHTML = `<div class="empty"><h1 class="page-title">your profile</h1><p>connect a wallet to see your bounties, claims and winnings.</p><button class="btn white" id="c2">connect</button></div>`
+      return ($('#c2').onclick = () => connect().then(() => go('/account/' + state.account, true), () => {}))
+    }
     if (path === '/leaderboard') return await leaderboard(params)
     if (path === '/explore') return await explore(params)
     if (path === '/feed') return await feed(params)
