@@ -9,6 +9,8 @@ A lean frontend for [poidh](https://poidh.xyz) (pics or it didn't happen), live 
 - `/upload` stores claim photos and videos by content hash in `DATA_DIR/uploads`; they are served from `/u/<sha256>.<ext>`.
 - Wallets are found through EIP-6963. Inside a Farcaster client the app is a mini app (`public/miniapp.js`, which talks the host protocol without the SDK) and uses the client's wallet. The manifest is at `/.well-known/farcaster.json`.
 
+Tests: `bun test` (needs nothing installed).
+
 Run locally:
 
 ```sh

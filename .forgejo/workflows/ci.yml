@@ -1,0 +1,12 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container: oven/bun:1.4.4-alpine
+    steps:
+      - uses: actions/checkout@v4
+      - run: bun test

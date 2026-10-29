@@ -1,4 +1,4 @@
-import { q, m, forget, encode, parseEth, fmtEth, fmtUsd, listWallets, wallets, switchChain, waitReceipt, rpc, $, $$, esc, short, ago, md } from './lib.js?v=__V__'
+import { q, m, forget, checksum, encode, parseEth, fmtEth, fmtUsd, listWallets, wallets, switchChain, waitReceipt, rpc, $, $$, esc, short, ago, md } from './lib.js?v=__V__'
 
 // --- protocol config ---------------------------------------------------------
 const V3 = '0x5555fa783936c260f77385b4e153b9725fef1719'
@@ -32,7 +32,7 @@ const unit = (chainId) => chainOf(chainId).currency || 'eth'
 const lc = (a) => String(a || '').toLowerCase()
 
 // --- state ---------------------------------------------------------------------
-const state = { account: null, provider: null, wallet: null, mini: null, prices: {} }
+const state = { account: null, provider: null, wallet: null, mini: null, prices: {}, session: null }
 const app = $('#app')
 let renderId = 0
 
@@ -68,7 +68,12 @@ async function hydratePeople(root = app) {
     missing.forEach((a) => peopleLoading.set(a, p))
   }
   await Promise.all(all.map((a) => peopleLoading.get(a)))
-  for (const el of $$('[data-who]', root)) if (people.get(el.dataset.who)) el.innerHTML = avatar(el.dataset.who) + (el.dataset.only ? '' : `<span class="ellipsis">${esc(nameOf(el.dataset.who))}</span>`)
+  // no farcaster profile: try ens / .wei / .gwei / .degen names (the server caches these)
+  const unnamed = all.filter((a) => !nameOf(a).includes('.') && nameOf(a) === short(a) && !names.has(a))
+  unnamed.forEach((a) => names.set(a, null))
+  await Promise.all(unnamed.map((a) => q('web3.fetchHumanReadableName', { address: a }).then((n) => n && names.set(a, n), () => {})))
+  for (const el of $$('[data-name]', root)) if (people.get(el.dataset.name) || names.get(el.dataset.name)) el.textContent = nameOf(el.dataset.name)
+  for (const el of $$('[data-who]', root)) if (people.get(el.dataset.who) || names.get(el.dataset.who)) el.innerHTML = avatar(el.dataset.who) + (el.dataset.only ? '' : `<span class="ellipsis">${esc(nameOf(el.dataset.who))}</span>`)
 }
 
 // --- claim media: claim.url is metadata json, an image or a video ------------
@@ -387,7 +392,8 @@ async function bountyPage(slug, dbId, params) {
         <div id="vote"></div>
         <div class="sec"><h2>${count} claim${count === 1 ? '' : 's'}</h2>${b.inProgress && !chain.retired ? '<button class="btn sm red" id="claim2">submit a claim</button>' : ''}</div>
         <div class="claims" id="claims"></div>
-        <div class="sec"><h2>comments</h2><a href="https://poidh.xyz${location.pathname}#comments" target="_blank" rel="noopener">reply on poidh.xyz ↗</a></div>
+        <div class="sec" id="comments-head"><h2>comments</h2></div>
+        <form class="compose" id="compose"><textarea rows="2" maxlength="2000" placeholder="say something nice"></textarea><button class="btn red sm">post</button></form>
         <div class="comments" id="comments"><div class="skel" style="height:60px"></div></div>
       </div>
       <aside class="side">
@@ -474,24 +480,82 @@ async function bountyPage(slug, dbId, params) {
     }))
   })
 
-  // comments (read-only: posting needs a poidh.xyz sign-in)
-  q('comments.fetch', { bountyId: dbId, chainId }).then((list) => {
-    if (id !== renderId) return
-    for (const c of list) if (c.author) people.set(lc(c.userAddress), c.author)
-    const kids = {}
-    for (const c of list) (kids[c.parentId ?? 0] ||= []).push(c)
-    const score = (c) => c.upvotes - c.downvotes
-    const tree = (pid, depth) => (kids[pid] || []).sort((a, z) => score(z) - score(a) || new Date(a.createdAt) - new Date(z.createdAt)).map((c) => `
-      <div class="comment" id="comment-${c.id}" style="margin-left:${Math.min(depth, 3) * 18}px">
-        <div class="bubble"><div class="row between" style="font-size:11px"><span>${who(c.userAddress)}</span><span class="dim">${ago(c.createdAt)}${score(c) ? ` · ▲ ${score(c)}` : ''}</span></div><div class="md">${md(c.body)}</div></div>
-      </div>${tree(c.id, depth + 1)}`).join('')
-    $('#comments').innerHTML = tree(0, 0) || '<div class="dim">no comments yet</div>'
-    hydratePeople($('#comments'))
-    if (location.hash) document.getElementById(location.hash.slice(1))?.scrollIntoView()
-  }).catch(() => ($('#comments').innerHTML = '<div class="dim">could not load comments</div>'))
+  loadComments(dbId, chainId, id)
 
   if (params.has('new')) share(b.title, location.origin + location.pathname, 'your bounty is live! share it so people can claim it.')
 }
+// --- comments: reading is public, posting and voting need a poidh session ------
+async function loadComments(bountyId, chainId, id = renderId) {
+  const list = await q('comments.fetch', { bountyId, chainId }).catch(() => null)
+  if (id !== renderId) return
+  if (!list) return ($('#comments').innerHTML = '<div class="dim">could not load comments</div>')
+  for (const c of list) if (c.author) people.set(lc(c.userAddress), c.author)
+  const kids = {}
+  for (const c of list) (kids[c.parentId ?? 0] ||= []).push(c)
+  const score = (c) => c.upvotes - c.downvotes
+  const tree = (pid, depth) => (kids[pid] || []).sort((a, z) => score(z) - score(a) || new Date(a.createdAt) - new Date(z.createdAt)).map((c) => `
+    <div class="comment" id="comment-${c.id}" style="margin-left:${Math.min(depth, 3) * 18}px">
+      <div class="bubble"><div class="row between" style="font-size:11px"><span>${who(c.userAddress)}</span><span class="dim">${ago(c.createdAt)}</span></div><div class="md">${md(c.body)}</div>
+        <div class="row cacts"><button data-rate="upvote" data-c="${c.id}">▲ ${c.upvotes || ''}</button><button data-rate="downvote" data-c="${c.id}">▼ ${c.downvotes || ''}</button><button data-reply="${c.id}">reply</button></div>
+      </div>
+    </div>${tree(c.id, depth + 1)}`).join('')
+  const box = $('#comments')
+  box.innerHTML = tree(0, 0) || '<div class="dim">no comments yet. start the conversation.</div>'
+  hydratePeople(box)
+  if (location.hash.startsWith('#comment-')) document.getElementById(location.hash.slice(1))?.scrollIntoView({ block: 'center' })
+  const post = async (form, parentId) => {
+    const text = $('textarea', form).value.trim()
+    if (!text) return
+    await act($('button', form), async () => {
+      await authed(() => m('comments.comment', { bountyId, chainId, text, ...(parentId ? { parrentId: parentId } : {}) }))
+      forget()
+      loadComments(bountyId, chainId)
+      form.reset()
+    })
+  }
+  $('#compose').onsubmit = (e) => { e.preventDefault(); post(e.target) }
+  box.onclick = (e) => {
+    const r = e.target.closest('[data-rate]')
+    if (r) return act(r, async () => { await authed(() => m('comments.rate', { chainId, commentId: +r.dataset.c, type: r.dataset.rate })); forget(); loadComments(bountyId, chainId) })
+    const rep = e.target.closest('[data-reply]')
+    if (!rep || rep.closest('.bubble').querySelector('form')) return
+    rep.closest('.bubble').insertAdjacentHTML('beforeend', '<form class="compose"><textarea rows="2" maxlength="2000" placeholder="reply"></textarea><button class="btn red sm">reply</button></form>')
+    const f = rep.closest('.bubble').querySelector('form')
+    $('textarea', f).focus()
+    f.onsubmit = (ev) => { ev.preventDefault(); post(f, +rep.dataset.reply) }
+  }
+}
+
+// poidh's backend only accepts sign-in messages for poidh.xyz, so that's the domain the wallet sees
+async function signIn() {
+  await connect()
+  const nonce = await m('auth.nonce')
+  const now = new Date()
+  const chainId = parseInt(await state.provider.request({ method: 'eth_chainId' }).catch(() => '0x2105'), 16) || 8453
+  const message = `poidh.xyz wants you to sign in with your Ethereum account:\n${checksum(state.account)}\n\nSign in to poidh to comment and vote. This is free and does not send a transaction.\n\nURI: https://poidh.xyz\nVersion: 1\nChain ID: ${chainId}\nNonce: ${nonce}\nIssued At: ${now.toISOString()}\nExpiration Time: ${new Date(+now + 600_000).toISOString()}`
+  toast('sign the message in your wallet (free, no transaction)')
+  const hex = '0x' + [...new TextEncoder().encode(message)].map((b) => b.toString(16).padStart(2, '0')).join('')
+  const signature = await state.provider.request({ method: 'personal_sign', params: [hex, state.account] })
+  await m('auth.signIn', { message, signature })
+  state.session = state.account
+}
+// runs fn with a session for the connected wallet, signing in when there is none or it's someone else's
+async function authed(fn) {
+  await connect()
+  if (state.session !== state.account) {
+    const me = await q('auth.me', null, { fresh: true }).catch(() => null)
+    if (lc(me?.address) === state.account) state.session = state.account
+    else await signIn()
+  }
+  try {
+    return await fn()
+  } catch (e) {
+    if (e.code !== 'UNAUTHORIZED') throw e
+    await signIn()
+    return fn()
+  }
+}
+
 const reload = () => {
   forget()
   route()
@@ -801,6 +865,41 @@ async function explore(params) {
   infinite($('#bounties'), (cursor) => q('bounties.fetchByKeyword', { keyword: s, limit: 12, ...(cursor ? { cursor } : {}) }), (items) => items.map((b) => bountyCard(b, p)).join(''), 'no bounties match that')
 }
 
+async function feed(params) {
+  const tab = params.get('tab') === 'you' && state.account ? 'you' : 'all'
+  app.innerHTML = `<h1 style="font-size:28px;margin:10px 0 4px">activity</h1>
+    <div class="toolbar" style="margin-top:12px"><div class="tabs"><a href="/feed" class="${tab === 'all' ? 'on' : ''}">everyone</a>${state.account ? `<a href="/feed?tab=you" class="${tab === 'you' ? 'on' : ''}">you</a>` : ''}</div></div>
+    <div class="feed" id="feed"></div>`
+  const p = await price()
+  infinite($('#feed'), (cursor) => q('accounts.activities', { limit: 20, ...(tab === 'you' ? { address: state.account } : {}), ...(cursor ? { cursor } : {}) }), async (items) => items.map((a) => activityRow(a, p)).join(''), tab === 'you' ? 'nothing yet. create a bounty or submit a claim!' : 'no activity')
+}
+function activityRow(a, p) {
+  const b = a.bounty
+  const href = b ? bountyPath(b) + (a.comment ? `#comment-${a.comment.id}` : '') : '#'
+  const title = b ? `<b>${esc(b.title)}</b>` : 'a bounty'
+  const act = a.action || ''
+  const money = (eth) => `${eth} ${unit(a.chainId)}${p && unit(a.chainId) === 'eth' ? ` (${fmtUsd(+eth * p)})` : ''}`
+  const text =
+    act === 'bounty created' ? `created ${title}${b ? ` for ${money(fmtEth(b.amount))}` : ''}`
+      : act === 'claim created' ? `claimed ${title}`
+        : act === 'claim accepted' ? `accepted a claim on ${title} 🏆`
+          : /^[+-]/.test(act) ? `${act[0] === '+' ? 'added' : 'withdrew'} ${money(act.slice(1).replace(/\s*eth$/, '').trim())} ${act[0] === '+' ? 'to' : 'from'} ${title}`
+            : act.includes('submitted for vote') ? `nominated a claim on ${title} for a vote`
+              : act === 'voted' ? `voted on ${title}`
+                : act === 'voting resolved' ? `resolved the vote on ${title}`
+                  : act === 'bounty canceled' ? `cancelled ${title}`
+                    : act === 'comment created' ? `commented on ${title}`
+                      : act === 'reply created' ? `replied on ${title}`
+                        : `${esc(act)} · ${title}`
+  return `<a class="act" href="${href}">
+    <span data-who="${esc(lc(a.address))}" data-only="av">${avatar(a.address)}</span>
+    <div class="grow"><div><span class="nm" data-name="${esc(lc(a.address))}">${esc(nameOf(a.address))}</span> ${text}</div>
+      ${a.comment?.body ? `<div class="quote">${esc(plain(a.comment.body).slice(0, 240))}</div>` : ''}
+      <div class="dim" style="font-size:11px">${ago(Number(a.timestamp))} · ${chainOf(a.chainId).label}</div></div>
+    ${a.claim?.url ? `<div class="thumb" data-media data-src="${esc(a.claim.url)}" data-alt=""></div>` : ''}
+  </a>`
+}
+
 function notFound(msg = 'page not found') {
   app.innerHTML = `<div class="empty"><h1 style="font-size:28px">${esc(msg)}</h1><p><a href="/">back to bounties</a></p></div>`
 }
@@ -866,6 +965,7 @@ async function route(params) {
     if (path === '/create') return await create()
     if (path === '/leaderboard') return await leaderboard(params)
     if (path === '/explore') return await explore(params)
+    if (path === '/feed') return await feed(params)
     notFound()
   } catch (e) {
     console.error(e)

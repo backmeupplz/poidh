@@ -187,3 +187,45 @@ export function md(src) {
   flush()
   return out
 }
+
+// --- keccak-256 (for checksummed addresses) ---
+const RC = ['1', '8082', '800000000000808a', '8000000080008000', '808b', '80000001', '8000000080008081', '8000000000008009', '8a', '88', '80008009', '8000000a',
+  '8000808b', '800000000000008b', '8000000000008089', '8000000000008003', '8000000000008002', '8000000000000080', '800a', '800000008000000a', '8000000080008081',
+  '8000000000008080', '80000001', '8000000080008008'].map((h) => BigInt('0x' + h))
+const ROT = [0, 1, 62, 28, 27, 36, 44, 6, 55, 20, 3, 10, 43, 25, 39, 41, 45, 15, 21, 8, 18, 2, 61, 56, 14].map(BigInt)
+const M64 = (1n << 64n) - 1n
+const rotl = (x, n) => (n ? ((x << n) | (x >> (64n - n))) & M64 : x)
+export function keccak256(bytes) {
+  const rate = 136
+  const p = new Uint8Array(Math.floor(bytes.length / rate + 1) * rate)
+  p.set(bytes)
+  p[bytes.length] ^= 1
+  p[p.length - 1] ^= 0x80
+  const s = Array(25).fill(0n)
+  for (let off = 0; off < p.length; off += rate) {
+    for (let i = 0; i < rate / 8; i++) {
+      let v = 0n
+      for (let b = 7; b >= 0; b--) v = (v << 8n) | BigInt(p[off + i * 8 + b])
+      s[i] ^= v
+    }
+    for (let r = 0; r < 24; r++) {
+      const C = [0, 1, 2, 3, 4].map((x) => s[x] ^ s[x + 5] ^ s[x + 10] ^ s[x + 15] ^ s[x + 20])
+      for (let x = 0; x < 5; x++) {
+        const D = C[(x + 4) % 5] ^ rotl(C[(x + 1) % 5], 1n)
+        for (let y = 0; y < 25; y += 5) s[y + x] ^= D
+      }
+      const B = Array(25)
+      for (let x = 0; x < 5; x++) for (let y = 0; y < 5; y++) B[y + 5 * ((2 * x + 3 * y) % 5)] = rotl(s[x + 5 * y], ROT[x + 5 * y])
+      for (let i = 0; i < 25; i++) s[i] = B[i] ^ (~B[((i % 5) + 1) % 5 + 5 * Math.floor(i / 5)] & M64 & B[((i % 5) + 2) % 5 + 5 * Math.floor(i / 5)])
+      s[0] ^= RC[r]
+    }
+  }
+  let out = ''
+  for (let i = 0; i < 4; i++) for (let b = 0; b < 8; b++) out += Number((s[i] >> BigInt(8 * b)) & 255n).toString(16).padStart(2, '0')
+  return out
+}
+export function checksum(addr) {
+  const a = addr.toLowerCase().replace(/^0x/, '')
+  const h = keccak256(new TextEncoder().encode(a))
+  return '0x' + [...a].map((c, i) => (parseInt(h[i], 16) >= 8 ? c.toUpperCase() : c)).join('')
+}
