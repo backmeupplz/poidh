@@ -192,7 +192,8 @@ async function thumb(req: Request, url: URL) {
     const p = Bun.spawn(['vipsthumbnail', src, '--size', `${size}x${size}`, '-o', `${THUMBS}/${name}[Q=78,strip]`], { stderr: 'ignore' })
     await p.exited
     await Bun.file(src).delete().catch(() => {})
-    return (await out.exists()) ? new Response(out, { headers }) : original()
+    const made = Bun.file(`${THUMBS}/${name}`) // a fresh handle: `out` cached the missing file's size
+    return (await made.exists()) ? new Response(made, { headers }) : original()
   } catch {
     return original()
   } finally {
