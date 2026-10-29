@@ -154,6 +154,7 @@ function mediaFor(u: string): Promise<Media | undefined> {
   if (!resolving.has(u))
     resolving.set(u, resolveMedia(u).then((m) => {
       media.set(u, m)
+      if (m && !m.video && !/\.gif(\?|$)/i.test(m.src)) makeThumb(m.src, 640)
       mediaLog.write(JSON.stringify([u, m]) + '\n')
       mediaLog.flush()
       return m
@@ -171,34 +172,45 @@ async function resolve(req: Request, url: URL) {
 // GET /thumb?u=<image>: a small webp made with libvips, cached on disk; falls back to the original
 const THUMBS = `${DATA}/thumbs`
 mkdirSync(THUMBS, { recursive: true })
-let vipsBusy = 0
+// at most 6 vips jobs at once; the rest wait their turn instead of falling back to multi-MB originals
+let active = 0
+const waiting: (() => void)[] = []
+async function slot<T>(fn: () => Promise<T>) {
+  if (active >= 6) await new Promise<void>((r) => waiting.push(r))
+  active++
+  try {
+    return await fn()
+  } finally {
+    active--
+    waiting.shift()?.()
+  }
+}
+const making = new Map<string, Promise<boolean>>()
+const thumbName = (u: string, size: number) => new Bun.CryptoHasher('sha256').update(size + u).digest('hex') + '.webp'
+function makeThumb(u: string, size: number): Promise<boolean> {
+  const name = thumbName(u, size)
+  if (!making.has(name))
+    making.set(name, slot(async () => {
+      if (await Bun.file(`${THUMBS}/${name}`).exists()) return true
+      const r = await safeFetch(u, 20000)
+      const type = r.headers.get('content-type') || ''
+      if (!/^image\/(jpeg|png|webp|avif|heic)/.test(type) || Number(r.headers.get('content-length') || 0) > 40_000_000) return r.body?.cancel(), false
+      const src = `${THUMBS}/${name}.src`
+      await Bun.write(src, r)
+      await Bun.spawn(['vipsthumbnail', src, '--size', `${size}x${size}`, '-o', `${THUMBS}/${name}[Q=78,strip]`], { stderr: 'ignore' }).exited
+      await Bun.file(src).delete().catch(() => {})
+      return Bun.file(`${THUMBS}/${name}`).exists()
+    }).catch(() => false).finally(() => making.delete(name)))
+  return making.get(name)!
+}
 async function thumb(req: Request, url: URL) {
   const u = url.searchParams.get('u') || ''
   const size = url.searchParams.get('w') === '96' ? 96 : 640
-  const name = new Bun.CryptoHasher('sha256').update(size + u).digest('hex') + '.webp'
-  const out = Bun.file(`${THUMBS}/${name}`)
+  if (!/^https?:/.test(u)) return new Response('bad url', { status: 400 })
   const headers = { 'content-type': 'image/webp', 'cache-control': 'public, max-age=31536000, immutable' }
-  if (await out.exists()) return new Response(out, { headers })
-  const original = () => Response.redirect(u, 302)
-  // ponytail: busy-wait slot limit, a real queue if thumbnails pile up
-  if (!/^https?:/.test(u) || vipsBusy >= 4) return original()
-  vipsBusy++
-  try {
-    const r = await safeFetch(u, 15000)
-    const type = r.headers.get('content-type') || ''
-    if (!/^image\/(jpeg|png|webp|avif|heic)/.test(type) || Number(r.headers.get('content-length') || 0) > 40_000_000) return r.body?.cancel(), original()
-    const src = `${THUMBS}/${name}.src`
-    await Bun.write(src, r)
-    const p = Bun.spawn(['vipsthumbnail', src, '--size', `${size}x${size}`, '-o', `${THUMBS}/${name}[Q=78,strip]`], { stderr: 'ignore' })
-    await p.exited
-    await Bun.file(src).delete().catch(() => {})
-    const made = Bun.file(`${THUMBS}/${name}`) // a fresh handle: `out` cached the missing file's size
-    return (await made.exists()) ? new Response(made, { headers }) : original()
-  } catch {
-    return original()
-  } finally {
-    vipsBusy--
-  }
+  const path = `${THUMBS}/${thumbName(u, size)}`
+  if ((await Bun.file(path).exists()) || (await makeThumb(u, size))) return new Response(Bun.file(path), { headers })
+  return Response.redirect(u, 302)
 }
 
 // --- claim uploads, stored by content hash ---------------------------------------
@@ -259,49 +271,89 @@ const embed = (url: string, image: string, title: string, type: 'launch_miniapp'
 const esc = (s: string) => s.replace(/[&<>"]/g, (c) => `&#${c.charCodeAt(0)};`)
 const CHAINS: Record<string, number> = { mainnet: 1, arbitrum: 42161, base: 8453 }
 
-async function page(req: Request, url: URL) {
-  let title = "poidh - pics or it didn't happen"
-  let desc = 'social bounties for fun. post a bounty, anyone can claim it with a pic, the best proof gets paid onchain.'
-  let image = url.origin + '/og.png'
-  let embedImage = url.origin + '/embed.png'
-  let button = 'open poidh'
-  const m = url.pathname.match(/^\/(mainnet|arbitrum|base)\/bounty\/(\d+)\/?$/)
-  // people get the page at once (the app loads its own data); link previews wait for the bounty's meta
-  const ua = req.headers.get('user-agent') || ''
-  if (m && (CRAWLER.test(ua) || !/mozilla/i.test(ua))) {
-    try {
-      const chainId = CHAINS[m[1]]
-      const get = async (proc: string, input: unknown) => {
-        const key = `/api/trpc/${proc}?batch=1&input=${encodeURIComponent(JSON.stringify({ 0: { json: input } }))}`
-        const hit = cache.get(key) ?? (await fetchInto(key, req))
-        return JSON.parse(new TextDecoder().decode(hit.asset.body))[0]?.result?.data?.json
-      }
-      const [b, price, parts] = await Promise.all([
-        get('bounties.fetch', { id: Number(m[2]), chainId }),
-        get('web3.fetchPrice', { currency: 'eth' }),
-        get('bounties.participations', { bountyId: Number(m[2]), chainId }),
-      ])
-      if (b?.title) {
-        title = `${b.title} | poidh`
-        desc = String(b.description || '').replace(/[#*_`>]/g, '').replace(/\s+/g, ' ').trim().slice(0, 200)
-        const og = (format: string) => `${url.origin}/api/og/bounty?${new URLSearchParams({
-          title: String(b.title).slice(0, 100), amount: String(b.amount), chainId: String(chainId), currencyRate: String(price || 0),
-          participants: (parts || []).map((p: { userAddress: string }) => p.userAddress).join(','),
-        })}&imageFormat=${format}`
-        image = og('og')
-        embedImage = og('preview')
-        button = b.inProgress ? 'view bounty' : 'see the winner'
-      }
-    } catch {}
+type Meta = { title: string; desc: string; image?: string; embed?: string; button?: string }
+const DEFAULT_DESC = 'social bounties for fun. post a bounty with eth, anyone can claim it with a pic, and the best proof gets paid onchain.'
+const STATIC: Record<string, Meta> = {
+  '/': { title: "poidh - pics or it didn't happen", desc: DEFAULT_DESC },
+  '/feed': { title: 'activity | poidh', desc: 'everything happening on poidh right now: new bounties, claims, payouts, votes and comments.', button: 'see activity' },
+  '/leaderboard': { title: 'leaderboard | poidh', desc: 'the top poidh hunters and issuers, ranked by eth earned, eth paid out and claims collected.', button: 'see the leaderboard' },
+  '/create': { title: 'create a bounty | poidh', desc: 'describe what you want to see, put up eth, and the best pic wins. solo or open bounties on base, arbitrum and ethereum.', button: 'create a bounty' },
+  '/explore': { title: 'search | poidh', desc: 'search poidh bounties and people.', button: 'search poidh' },
+}
+const clean = (s: unknown) => String(s || '').replace(/!\[[^\]]*\]\([^)]*\)/g, '').replace(/\[([^\]]+)\]\([^)]*\)/g, '$1').replace(/[#*_`>~]/g, '').replace(/\s+/g, ' ').trim()
+const cut = (s: string, n: number) => (s.length > n ? s.slice(0, n - 1).trimEnd() + '…' : s)
+
+async function metaFor(req: Request, url: URL): Promise<Meta> {
+  const get = async (proc: string, input: unknown) => {
+    const key = `/api/trpc/${proc}?batch=1&input=${encodeURIComponent(JSON.stringify({ 0: { json: input } }))}`
+    const hit = cache.get(key) ?? (await fetchInto(key, req))
+    return JSON.parse(new TextDecoder().decode(hit.asset.body))[0]?.result?.data?.json
   }
+  const og = (path: string, params: Record<string, string>, format: string) => `${url.origin}/api/og/${path}?${new URLSearchParams(params)}&imageFormat=${format}`
+  let m
+  if ((m = url.pathname.match(/^\/(mainnet|arbitrum|base)\/bounty\/(\d+)\/?$/))) {
+    const chainId = CHAINS[m[1]]
+    const [b, price, parts] = await Promise.all([
+      get('bounties.fetch', { id: Number(m[2]), chainId }),
+      get('web3.fetchPrice', { currency: 'eth' }),
+      get('bounties.participations', { bountyId: Number(m[2]), chainId }),
+    ])
+    if (!b?.title) return STATIC['/']
+    const eth = Number(BigInt(b.amount)) / 1e18
+    const params = {
+      title: String(b.title).slice(0, 100), amount: String(b.amount), chainId: String(chainId), currencyRate: String(price || 0),
+      participants: (parts || []).map((p: { userAddress: string }) => p.userAddress).join(','),
+    }
+    return {
+      title: `${b.title} | poidh`,
+      desc: cut(`${+eth.toFixed(5)} eth${price ? ` ($${(eth * price).toFixed(2)})` : ''} bounty${b.inProgress ? ', open for claims' : ''}. ${clean(b.description)}`, 200),
+      image: og('bounty', params, 'og'), embed: og('bounty', params, 'preview'), button: b.inProgress ? 'view bounty' : 'see the winner',
+    }
+  }
+  if ((m = url.pathname.match(/^\/account\/(0x[0-9a-fA-F]{40})\/?$/))) {
+    const address = m[1].toLowerCase()
+    const [users, name, stats, counts] = await Promise.all([
+      get('neynar.usersData', { addresses: [address] }), get('web3.fetchHumanReadableName', { address }),
+      get('accounts.stats', { address }), get('accounts.activitiesCount', { address }),
+    ])
+    const u = users?.[0]
+    const who = u?.farcasterTag || u?.gwei || u?.wei || u?.ens || u?.degenName || name || `${address.slice(0, 6)}…${address.slice(-4)}`
+    const params = { address, poidhScore: String(stats?.poidhScore ?? 0), totalBounties: String(counts?.bounties ?? 0), totalClaims: String(counts?.claims ?? 0) }
+    return {
+      title: `${who} | poidh`,
+      desc: `${who} on poidh: ${Number(stats?.poidhScore || 0).toLocaleString()} poidh score, ${counts?.bounties ?? 0} bounties, ${counts?.claims ?? 0} claims, $${(stats?.eth?.totalEarn?.amountUSD ?? 0).toFixed(2)} earned.`,
+      image: og('account', params, 'og'), embed: og('account', params, 'preview'), button: 'view profile',
+    }
+  }
+  if ((m = url.pathname.match(/^\/a\/([^/]+)\/?$/))) {
+    const album = decodeURIComponent(m[1]).toLowerCase().slice(0, 40)
+    return {
+      title: `#${album} bounties | poidh`, desc: `${album} bounties on poidh: see the open ones, the votes in progress and the past winners.`,
+      image: og('album', { album }, 'og'), embed: og('album', { album }, 'preview'), button: `see #${album}`,
+    }
+  }
+  return STATIC[url.pathname.replace(/\/+$/, '') || '/'] || STATIC['/']
+}
+
+async function page(req: Request, url: URL) {
+  // people get the page at once (the app loads its own data); link previews wait for the page's meta
+  const ua = req.headers.get('user-agent') || ''
+  const crawler = CRAWLER.test(ua) || !/mozilla/i.test(ua)
+  const known = STATIC[url.pathname.replace(/\/+$/, '') || '/']
+  const meta = known || !crawler ? known || STATIC['/'] : await metaFor(req, url).catch(() => STATIC['/'])
+  const image = meta.image || url.origin + '/og.png'
+  const embedImage = meta.embed || url.origin + '/embed.png'
+  // warm poidh's slow image renders (up to ~10 s) so the crawler's follow-up fetch is instant
+  for (const i of [meta.image, meta.embed]) if (i && !cache.has(new URL(i).pathname + new URL(i).search)) fetchInto(new URL(i).pathname + new URL(i).search, req).catch(() => {})
   const here = url.origin + url.pathname
   const html = shell
-    .replaceAll('__TITLE__', esc(title))
-    .replaceAll('__DESC__', esc(desc))
+    .replaceAll('__TITLE__', esc(meta.title))
+    .replaceAll('__DESC__', esc(meta.desc))
     .replaceAll('__IMAGE__', esc(image))
     .replaceAll('__URL__', esc(here))
-    .replace('__MINIAPP__', esc(embed(here, embedImage, button, 'launch_miniapp')))
-    .replace('__FRAME__', esc(embed(here, embedImage, button, 'launch_frame')))
+    .replaceAll('__ALT__', esc(cut(meta.title.replace(/ \| poidh$/, ''), 120)))
+    .replace('__MINIAPP__', esc(embed(here, embedImage, meta.button || 'open poidh', 'launch_miniapp')))
+    .replace('__FRAME__', esc(embed(here, embedImage, meta.button || 'open poidh', 'launch_frame')))
   return send(req, packed(new TextEncoder().encode(html), types.html), { 'cache-control': 'no-cache' })
 }
 

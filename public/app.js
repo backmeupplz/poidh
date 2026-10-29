@@ -1,3 +1,4 @@
+import { sfx, soundOn, setSound } from './sfx.js?v=__V__'
 import { q, m, forget, checksum, encode, parseEth, fmtEth, fmtUsd, listWallets, wallets, switchChain, waitReceipt, rpc, $, $$, esc, short, ago, md } from './lib.js?v=__V__'
 
 // --- protocol config ---------------------------------------------------------
@@ -87,23 +88,41 @@ async function resolveAll(urls) {
   return Promise.all(urls.map((u) => mediaCache.get(u) ?? null))
 }
 const thumbUrl = (src) => (/\.gif(\?|$)/i.test(src) || src.startsWith(location.origin + '/u/') ? src : '/thumb?u=' + encodeURIComponent(src))
-const mediaEl = (m, alt = '') =>
-  !m ? `<div class="ph" style="background:${grad('0x' + alt.length.toString(16) + 'abc123')}"></div>`
-    : m.video ? `<video src="${esc(m.src)}#t=0.1" muted playsinline preload="metadata" loop></video>`
-      : `<img src="${esc(thumbUrl(m.src))}" alt="${esc(alt)}" loading="lazy" decoding="async">`
+// .fit = shimmer → blurred backdrop + the whole picture (contain); `cover` crops for small square tiles
+function mediaEl(m, alt = '', cover = false) {
+  if (!m) return `<div class="fit ready"><div class="ph" style="background:${grad('0x' + (alt.length * 7919).toString(16) + 'abc123')}"></div></div>`
+  if (m.video) return `<div class="fit loading${cover ? ' cover' : ''}"><video class="fg" src="${esc(m.src)}#t=0.1" muted playsinline preload="metadata" loop></video></div>`
+  const src = esc(thumbUrl(m.src))
+  return `<div class="fit loading${cover ? ' cover' : ''}">${cover ? '' : `<img class="bg" src="${src}" alt="" aria-hidden="true" decoding="async">`}<img class="fg" src="${src}" alt="${esc(alt)}" decoding="async"></div>`
+}
+function wireMedia(fit, m) {
+  const fg = fit.querySelector('.fg')
+  if (!fg) return
+  const ready = () => fit.classList.replace('loading', 'ready')
+  if (fg.tagName === 'VIDEO') {
+    fg.addEventListener('loadeddata', ready, { once: true })
+    fg.addEventListener('mouseenter', () => fg.play().catch(() => {}))
+    fg.addEventListener('mouseleave', () => fg.pause())
+  } else if (fg.complete && fg.naturalWidth) ready()
+  else fg.addEventListener('load', ready, { once: true })
+  // metadata can point at a video without a video extension
+  fg.addEventListener('error', () => {
+    if (fg.tagName === 'VIDEO' || !m) return ready()
+    m.video = true
+    fit.outerHTML = mediaEl(m, '', fit.classList.contains('cover'))
+  }, { once: true })
+}
 async function hydrateMedia(root = app) {
   const els = $$('[data-media]', root)
-  els.forEach((el) => el.removeAttribute('data-media'))
+  for (const el of els) {
+    el.removeAttribute('data-media')
+    el.insertAdjacentHTML('afterbegin', '<div class="fit loading"></div>')
+  }
   const list = await resolveAll(els.map((el) => el.dataset.src))
   els.forEach((el, i) => {
-    const m = list[i]
-    el.insertAdjacentHTML('afterbegin', mediaEl(m, el.dataset.alt || ''))
-    // metadata can point at a video without a video extension
-    const img = el.querySelector('img')
-    if (img) img.onerror = () => { m.video = true; img.outerHTML = mediaEl(m) }
-    el.querySelector('video')?.addEventListener('mouseenter', (e) => e.target.play().catch(() => {}))
-    el.querySelector('video')?.addEventListener('mouseleave', (e) => e.target.pause())
-    if (el.classList.contains('media')) el.onclick = () => m && lightbox(m)
+    el.querySelector('.fit')?.remove()
+    el.insertAdjacentHTML('afterbegin', mediaEl(list[i], el.dataset.alt || '', el.classList.contains('tile') || el.classList.contains('thumb')))
+    wireMedia(el.querySelector('.fit'), list[i])
   })
 }
 function lightbox(m) {
@@ -120,10 +139,13 @@ function lightbox(m) {
 function toast(msg, err = false) {
   $('.toast')?.remove()
   const t = Object.assign(document.createElement('div'), { className: 'toast' + (err ? ' err' : ''), textContent: msg })
+  if (err) sfx.error()
   document.body.append(t)
   setTimeout(() => t.remove(), err ? 6000 : 3500)
 }
+const done = (msg) => (toast(msg), sfx.success())
 function sheet(html, onOpen) {
+  sfx.open()
   const d = document.createElement('dialog')
   d.innerHTML = `<div class="sheet">${html}</div>`
   d.addEventListener('click', (e) => e.target === d && d.close())
@@ -387,8 +409,7 @@ async function bountyPage(slug, dbId, params) {
         <div class="row wrapflex muted" style="font-size:12px">${who(b.issuer)}<span>·</span><span>${ago(b.createdAt)}</span>${b.extra?.album ? `<span>·</span><a href="/a/${esc(encodeURIComponent(b.extra.album))}" class="pill">#${esc(b.extra.album)}</a>` : ''}</div>
       </header>
       <div class="bmain">
-        <div class="md" id="desc">${md(b.description)}</div>
-        <button class="btn sm hide" id="more">show more</button>
+        <div class="panel"><div class="md" id="desc">${md(b.description)}</div><button class="btn sm hide more-btn" id="more">show more</button></div>
         <div id="vote"></div>
         <div class="sec"><h2>${count} claim${count === 1 ? '' : 's'}</h2>${b.inProgress && !chain.retired ? '<button class="btn sm red" id="claim2">submit a claim</button>' : ''}</div>
         <div class="claims" id="claims"></div>
@@ -428,14 +449,14 @@ async function bountyPage(slug, dbId, params) {
     if (b.isMultiplayer && !b.isVoting) actions.push(['add funds', '', () => joinForm(b, p)])
     if (mine && !isIssuer && !b.isVoting) actions.push(['withdraw my funds', '', (btn) => act(btn, async () => {
       await send(chainId, encode(SEL.withdrawFromOpenBounty, ['uint256'], [b.onChainId]), 0n, 'withdrawal')
-      toast('withdrawn. the funds are in your wallet.')
+      done('withdrawn. the funds are in your wallet.')
       reload()
     })])
     if (isIssuer && !b.isVoting) actions.push(['cancel bounty', '', (btn) => {
       confirmSheet('cancel this bounty?', b.isMultiplayer ? 'contributors can claim their refund on this page, and your share becomes withdrawable from your profile.' : 'your eth becomes withdrawable from your profile.', 'cancel bounty', () => act(btn, async () => {
         await send(chainId, encode(b.isMultiplayer ? SEL.cancelOpenBounty : SEL.cancelSoloBounty, ['uint256'], [b.onChainId]), 0n, 'cancellation')
         await poll(() => q('bounties.isCanceled', { chainId, id: dbId }, { fresh: true }), 20)
-        toast('bounty cancelled. withdraw your eth from your profile.')
+        done('bounty cancelled. withdraw your eth from your profile.')
         reload()
       }))
     }])
@@ -444,7 +465,7 @@ async function bountyPage(slug, dbId, params) {
     const claimed = await q('accounts.hasClaimedRefund', { address: me, bountyId: dbId, chainId }).catch(() => true)
     if (!claimed) actions.push(['claim refund', 'red', (btn) => act(btn, async () => {
       await send(chainId, encode(SEL.claimRefundFromCancelledOpenBounty, ['uint256'], [b.onChainId]), 0n, 'refund')
-      toast('refund claimed. withdraw it from your profile.')
+      done('refund claimed. withdraw it from your profile.')
       reload()
     })])
   }
@@ -467,18 +488,35 @@ async function bountyPage(slug, dbId, params) {
   // claims
   const canPick = isIssuer && b.inProgress && !b.isVoting && !chain.retired
   infinite($('#claims'), (cursor) => q('claims.fetchBountyClaims', { bountyId: dbId, chainId, limit: 9, ...(cursor ? { cursor } : {}) }), async (items) => items.map((c) => claimCard(c, { canPick, mustVote, voting })).join(''), b.inProgress ? 'no claims yet. be the first!' : 'no claims')
-  $('#claims').addEventListener('click', (e) => {
+  const pick = (c, vote, btn) => confirmSheet(vote ? 'submit this claim for a vote?' : 'accept this claim?', vote ? 'contributors get 48 hours to vote. if the vote passes, the claim wins the bounty.' : 'the bounty pays out to this claim. this cannot be undone.', vote ? 'start vote' : 'accept & pay', () => act(btn, async () => {
+    await send(chainId, encode(vote ? SEL.submitClaimForVote : SEL.acceptClaim, ['uint256', 'uint256'], [b.onChainId, c.onChainId]), 0n, vote ? 'vote submission' : 'acceptance')
+    done(vote ? 'voting started' : 'claim accepted, bounty paid out!')
+    await poll(() => vote ? q('bounties.fetchVoting', { bountyId: dbId, chainId }, { fresh: true }).then((v) => v?.claimId === c.id && v) : q('claims.isAccepted', { chainId, id: c.id }, { fresh: true }), 20)
+    reload()
+  }))
+  const open = (e) => {
+    if (e.type === 'keydown' && e.key !== 'Enter') return
     const btn = e.target.closest('[data-pick]')
-    if (!btn) return
-    const c = { id: +btn.dataset.pick, onChainId: +btn.dataset.onchain }
-    const vote = btn.dataset.vote === '1'
-    confirmSheet(vote ? 'submit this claim for a vote?' : 'accept this claim?', vote ? 'contributors get 48 hours to vote. if the vote passes, the claim wins the bounty.' : 'the bounty pays out to this claim. this cannot be undone.', vote ? 'start vote' : 'accept & pay', () => act(btn, async () => {
-      await send(chainId, encode(vote ? SEL.submitClaimForVote : SEL.acceptClaim, ['uint256', 'uint256'], [b.onChainId, c.onChainId]), 0n, vote ? 'vote submission' : 'acceptance')
-      toast(vote ? 'voting started' : 'claim accepted, bounty paid out!')
-      await poll(() => vote ? q('bounties.fetchVoting', { bountyId: dbId, chainId }, { fresh: true }).then((v) => v?.claimId === c.id && v) : q('claims.isAccepted', { chainId, id: c.id }, { fresh: true }), 20)
-      reload()
-    }))
-  })
+    if (btn) return pick(claimsById.get(+btn.dataset.pick), btn.dataset.vote === '1', btn)
+    const card = e.target.closest('[data-claim]')
+    if (!card || e.target.closest('a')) return
+    const c = claimsById.get(+card.dataset.claim)
+    const d = sheet(`<div class="claim-view">
+      <div class="big" data-media data-src="${esc(c.url)}" data-alt="${esc(c.title)}"></div>
+      <div class="row between wrapflex"><h2>${esc(c.title)}</h2>${c.isAccepted ? '<span class="pill white"><b>winner</b></span>' : ''}</div>
+      <div class="row wrapflex dim" style="font-size:12px">${who(c.issuer)}<span>·</span><span>claim #${c.onChainId}</span></div>
+      ${c.description ? `<div class="md">${md(c.description)}</div>` : ''}
+      ${canPick ? `<button class="btn red block" id="pick">${mustVote ? 'submit for vote' : 'accept this claim'}</button>` : ''}
+    </div>`)
+    hydrateMedia(d).then(() => {
+      const fg = $('.fg', d)
+      if (fg) fg.onclick = async () => lightbox((await resolveAll([c.url]))[0])
+    })
+    hydratePeople(d)
+    $('#pick', d)?.addEventListener('click', (ev) => { d.close(); pick(c, mustVote, ev.currentTarget) })
+  }
+  $('#claims').addEventListener('click', open)
+  $('#claims').addEventListener('keydown', open)
 
   loadComments(dbId, chainId, id)
 
@@ -561,9 +599,11 @@ const reload = () => {
   route()
 }
 
+const claimsById = new Map()
 function claimCard(c, { canPick, mustVote, voting }) {
   const underVote = voting && voting.claimId === c.id
-  return `<div class="claim ${c.isAccepted ? 'win' : ''}">
+  claimsById.set(c.id, c)
+  return `<div class="claim ${c.isAccepted ? 'win' : ''}" data-claim="${c.id}" tabindex="0" role="button" aria-label="${esc(c.title)}">
     <div class="media" data-media data-src="${esc(c.url)}" data-alt="${esc(c.title)}"></div>
     ${c.isAccepted ? '<span class="pill white ribbon"><b>winner</b></span>' : underVote ? '<span class="pill white ribbon"><b>under vote</b></span>' : ''}
     <div class="body">
@@ -595,12 +635,12 @@ async function renderVote(b, v, parts) {
   hydratePeople($('#vote'))
   $$('[data-v]').forEach((btn) => (btn.onclick = () => act(btn, async () => {
     await send(chainId, encode(SEL.voteClaim, ['uint256', 'bool'], [b.onChainId, btn.dataset.v === '1']), 0n, 'vote')
-    toast('vote cast')
+    done('vote cast')
     reload()
   })))
   $('#resolve')?.addEventListener('click', (e) => act(e.currentTarget, async () => {
     await send(chainId, encode(SEL.resolveVote, ['uint256'], [b.onChainId]), 0n, 'resolution')
-    toast('vote resolved')
+    done('vote resolved')
     reload()
   }))
 }
@@ -619,7 +659,7 @@ function share(title, url, note = '') {
     <button class="btn grow" id="cast">farcaster</button>
     <a class="btn grow" target="_blank" rel="noopener" href="https://x.com/intent/tweet?text=${encodeURIComponent(text)}&url=${encodeURIComponent(url)}">x</a>
     ${navigator.share ? '<button class="btn grow" id="native">more</button>' : ''}</div>`)
-  $('#copy', d).onclick = () => navigator.clipboard.writeText(url).then(() => toast('link copied'))
+  $('#copy', d).onclick = () => navigator.clipboard.writeText(url).then(() => done('link copied'))
   $('#cast', d).onclick = () => (state.mini ? state.mini.composeCast({ text, embeds: [url] }) : window.open(`https://farcaster.xyz/~/compose?text=${encodeURIComponent(text)}&embeds[]=${encodeURIComponent(url)}`, '_blank'))
   $('#native', d)?.addEventListener('click', () => navigator.share({ title: text, url }).catch(() => {}))
 }
@@ -647,7 +687,7 @@ function joinForm(b, p) {
     const wei = readAmount(d)
     await send(b.chainId, encode(SEL.joinOpenBounty, ['uint256'], [b.onChainId]), wei, 'contribution')
     d.close()
-    toast('you joined the bounty!')
+    done('you joined the bounty!')
     await poll(() => q('bounties.isJoined', { bountyId: b.id, chainId: b.chainId, participantAddress: state.account }, { fresh: true }), 20)
     reload()
   })
@@ -703,7 +743,7 @@ function claimForm(b) {
     const { url } = await up.json()
     const receipt = await send(b.chainId, encode(SEL.createClaim, ['uint256', 'string', 'string', 'string'], [b.onChainId, title, description, url]), 0n, 'claim')
     d.close()
-    toast('claim submitted!')
+    done('claim submitted!')
     const hash = lc(receipt.transactionHash)
     await poll(() => q('bounties.fetchTransactions', { bountyId: b.id, chainId: b.chainId }, { fresh: true }).then((t) => t.some((x) => lc(x.tx) === hash)), 30)
     reload()
@@ -713,9 +753,8 @@ function claimForm(b) {
 async function create() {
   const p = await price()
   app.innerHTML = `<a class="back" href="/">← all bounties</a>
-  <div style="max-width:640px;margin:0 auto;display:flex;flex-direction:column;gap:14px">
-    <h1 style="font-size:28px">create a bounty</h1>
-    <p class="muted" style="margin:0">describe what you want to see. put up eth. the best pic wins.</p>
+  <div class="form">
+    <div><h1 class="page-title">create a bounty</h1><p class="lead" style="margin:0">describe what you want to see. put up eth. the best pic wins.</p></div>
     <label class="field">title<input class="inp" id="t" maxlength="100" placeholder="e.g. take a pic of a cat wearing a tiny hat"></label>
     <label class="field">description<textarea id="ds" rows="8" placeholder="what counts as proof? any rules or deadline? markdown works."></textarea></label>
     <div class="field">type<div class="seg" id="type"><button class="on" data-v="solo">solo · you pick the winner</button><button data-v="open">open · others can add funds</button></div></div>
@@ -742,7 +781,7 @@ async function create() {
     const receipt = await send(chainId, encode(open ? SEL.createOpenBounty : SEL.createSoloBounty, ['string', 'string'], [title, description]), wei, 'bounty')
     const log = receipt.logs.find((l) => l.topics?.[0] === BOUNTY_CREATED && lc(l.address) === lc(CHAINS[chainId].contract))
     const onChainId = log ? Number(BigInt(log.topics[1])) : null
-    toast('bounty created! indexing…')
+    done('bounty created! indexing…')
     const row = onChainId != null && (await poll(() => q('bounties.isNewlyCreated', { chainId, id: onChainId }, { fresh: true })))
     if (!row) return go('/')
     const album = $('#al').value.trim().toLowerCase()
@@ -761,7 +800,7 @@ async function account(addr) {
     <div id="mine"></div>
     <div class="toolbar"><div class="tabs" id="tabs"><button class="on" data-t="bounties">bounties</button><button data-t="claims">claims</button><button data-t="nfts">collected</button></div></div>
     <div id="list"></div>`
-  $('#copy').onclick = () => navigator.clipboard.writeText(addr).then(() => toast('address copied'))
+  $('#copy').onclick = () => navigator.clipboard.writeText(addr).then(() => done('address copied'))
   Promise.all([q('neynar.usersData', { addresses: [addr] }).catch(() => []), q('web3.fetchHumanReadableName', { address: addr }).catch(() => null)]).then(([u, n]) => {
     if (u?.[0]) people.set(addr, u[0])
     if (n) names.set(addr, n)
@@ -824,14 +863,14 @@ async function ownerBox(addr) {
   </div>`
   $$('[data-w]').forEach((btn) => (btn.onclick = () => act(btn, async () => {
     await send(+btn.dataset.w, SEL.withdraw, 0n, 'withdrawal')
-    toast('withdrawn to your wallet')
+    done('withdrawn to your wallet')
     route()
   })))
 }
 
 async function leaderboard(params) {
   const page = Math.max(1, +params.get('page') || 1)
-  app.innerHTML = `<h1 style="font-size:28px;margin:10px 0 4px">leaderboard</h1><p class="muted" style="margin:0 0 18px">poidh score = eth earned and paid out, plus claims collected.</p><div class="panel" id="lb"><div class="skel" style="height:400px"></div></div>`
+  app.innerHTML = `<h1 class="page-title">leaderboard</h1><p class="lead">poidh score = eth earned and paid out, plus claims collected.</p><div class="panel" id="lb"><div class="skel" style="height:400px"></div></div>`
   const r = await q('leaderboard.fetch', { page, limit: 10, ...(state.account ? { userAddress: state.account } : {}) }).catch(() => null)
   if (!r) return ($('#lb').innerHTML = '<div class="empty">could not load the leaderboard</div>')
   const row = (rank, [a, s], me) => `<tr${me ? ' style="background:var(--glass-2)"' : ''}><td class="dim">${rank}</td><td>${who(a)}</td><td class="n">${s.total.toLocaleString()}</td></tr>`
@@ -845,7 +884,7 @@ async function leaderboard(params) {
 async function album(name, params) {
   name = decodeURIComponent(name).toLowerCase()
   const tab = ['open', 'progress', 'past'].includes(params.get('tab')) ? params.get('tab') : 'open'
-  app.innerHTML = `<a class="back" href="/">← all bounties</a><h1 style="font-size:28px">#${esc(name)}</h1>
+  app.innerHTML = `<a class="back" href="/">← all bounties</a><h1 class="page-title">#${esc(name)}</h1>
     <div class="toolbar"><div class="tabs" id="tabs"></div></div><div class="grid" id="bounties"></div>`
   q('bounties.fetchAlbumCounts', { album: name }).then((c) => {
     $('#tabs').innerHTML = [['open', 'open'], ['progress', 'voting'], ['past', 'past']].map(([k, l]) => `<a href="?tab=${k}" class="${tab === k ? 'on' : ''}">${l} ${c[k] ?? ''}</a>`).join('')
@@ -856,7 +895,7 @@ async function album(name, params) {
 
 async function explore(params) {
   const s = (params.get('search') || '').trim()
-  app.innerHTML = `<h1 style="font-size:24px;margin:10px 0 16px">${s ? `results for “${esc(s)}”` : 'explore'}</h1><div id="users"></div><div class="grid" id="bounties"></div>`
+  app.innerHTML = `<h1 class="page-title" style="margin-bottom:20px">${s ? `results for “${esc(s)}”` : 'explore'}</h1><div id="users"></div><div class="grid" id="bounties"></div>`
   const p = await price()
   if (s) q('users.fetchByKeyword', { search: s, limit: 8 }).then((r) => {
     if (!r.items.length) return
@@ -867,8 +906,8 @@ async function explore(params) {
 
 async function feed(params) {
   const tab = params.get('tab') === 'you' && state.account ? 'you' : 'all'
-  app.innerHTML = `<h1 style="font-size:28px;margin:10px 0 4px">activity</h1>
-    <div class="toolbar" style="margin-top:12px"><div class="tabs"><a href="/feed" class="${tab === 'all' ? 'on' : ''}">everyone</a>${state.account ? `<a href="/feed?tab=you" class="${tab === 'you' ? 'on' : ''}">you</a>` : ''}</div></div>
+  app.innerHTML = `<h1 class="page-title">activity</h1><p class="lead">bounties, claims, payouts, votes and comments as they happen.</p>
+    <div class="toolbar" style="margin-top:0"><div class="tabs"><a href="/feed" class="${tab === 'all' ? 'on' : ''}">everyone</a>${state.account ? `<a href="/feed?tab=you" class="${tab === 'you' ? 'on' : ''}">you</a>` : ''}</div></div>
     <div class="feed" id="feed"></div>`
   const p = await price()
   infinite($('#feed'), (cursor) => q('accounts.activities', { limit: 20, ...(tab === 'you' ? { address: state.account } : {}), ...(cursor ? { cursor } : {}) }), async (items) => items.map((a) => activityRow(a, p)).join(''), tab === 'you' ? 'nothing yet. create a bounty or submit a claim!' : 'no activity')
@@ -901,7 +940,7 @@ function activityRow(a, p) {
 }
 
 function notFound(msg = 'page not found') {
-  app.innerHTML = `<div class="empty"><h1 style="font-size:28px">${esc(msg)}</h1><p><a href="/">back to bounties</a></p></div>`
+  app.innerHTML = `<div class="empty"><h1 class="page-title">${esc(msg)}</h1><p><a href="/">back to bounties</a></p></div>`
 }
 
 // --- search box ----------------------------------------------------------------
@@ -930,11 +969,48 @@ document.addEventListener('click', (e) => !box.contains(e.target) && suggest.cla
 $('#search-toggle').onclick = () => { box.classList.toggle('closed'); $$('.logo, .nav').forEach((x) => x.classList.toggle('hide', !box.classList.contains('closed'))); input.focus() }
 
 // --- theme, connect --------------------------------------------------------------
-$('#theme').onclick = () => {
+const themeLabel = () => ($('#theme2').textContent = document.documentElement.dataset.theme === 'dark' ? 'light mode' : 'dark mode')
+$('#theme').onclick = $('#theme2').onclick = () => {
   const dark = document.documentElement.dataset.theme === 'dark'
   document.documentElement.dataset.theme = dark ? 'light' : 'dark'
   try { localStorage.setItem('theme', document.documentElement.dataset.theme) } catch {}
+  themeLabel()
 }
+themeLabel()
+const soundLabel = () => ($('#sound').textContent = `sound: ${soundOn() ? 'on' : 'off'}`)
+$('#sound').onclick = () => { setSound(!soundOn()); soundLabel(); sfx.tap() }
+soundLabel()
+document.addEventListener('pointerdown', (e) => {
+  if (e.target.closest('#sound')) return
+  if (e.target.closest('button:not(:disabled), a.btn, .tabs a, .card, .tile, .claim, .act, .nav a, .suggest a, summary')) sfx.tap()
+})
+// warm the next page's data on hover / touch so it opens instantly
+const warmed = new Set()
+function warm(e) {
+  const a = e.target.closest?.('a[href]')
+  if (!a || warmed.has(a.href)) return
+  const u = new URL(a.href)
+  if (u.origin !== location.origin) return
+  warmed.add(a.href)
+  let m
+  if ((m = u.pathname.match(/^\/(mainnet|arbitrum|base|degen)\/bounty\/(\d+)$/))) {
+    const chainId = BY_SLUG[m[1]].id
+    const id = +m[2]
+    q('bounties.fetch', { id, chainId }).catch(() => {})
+    q('bounties.participations', { bountyId: id, chainId }).catch(() => {})
+    q('bounties.claimsCount', { bountyId: id, chainId }).catch(() => {})
+    q('bounties.fetchVoting', { bountyId: id, chainId }).catch(() => {})
+    q('claims.fetchBountyClaims', { bountyId: id, chainId, limit: 9 }).then((r) => resolveAll(r.items.map((c) => c.url))).catch(() => {})
+    q('comments.fetch', { bountyId: id, chainId }).catch(() => {})
+  } else if ((m = u.pathname.match(/^\/account\/(0x[0-9a-f]{40})$/i))) {
+    const address = m[1].toLowerCase()
+    q('accounts.stats', { address }).catch(() => {})
+    q('accounts.activitiesCount', { address }).catch(() => {})
+    q('accounts.bounties', { address, limit: 12 }).catch(() => {})
+  }
+}
+document.addEventListener('pointerover', warm, { passive: true })
+document.addEventListener('touchstart', warm, { passive: true })
 $('#connect').onclick = () => (state.account ? accountMenu() : connect().catch(() => {}))
 
 // --- router --------------------------------------------------------------------
@@ -951,7 +1027,7 @@ async function route(params) {
   const path = location.pathname.replace(/\/+$/, '') || '/'
   params ||= new URLSearchParams(location.search)
   $$('[data-nav]').forEach((a) => a.classList.toggle('on', (a.dataset.nav === 'home' && path === '/') || path === '/' + a.dataset.nav))
-  $('#fab').classList.toggle('hide', path === '/create' || /\/bounty\//.test(path))
+  $('.create-btn').classList.toggle('hide', path === '/create')
   state.mini?.setBack(depth > 0)
   let m
   try {

@@ -15,12 +15,16 @@
 <meta property="og:image" content="__IMAGE__">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="__ALT__">
+<meta property="og:locale" content="en_US">
 <meta name="fc:miniapp" content="__MINIAPP__">
 <meta name="fc:frame" content="__FRAME__">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="__TITLE__">
 <meta name="twitter:description" content="__DESC__">
 <meta name="twitter:image" content="__IMAGE__">
+<meta name="twitter:image:alt" content="__ALT__">
+<meta name="twitter:site" content="@poidhxyz">
 <link rel="icon" href="/favicon.ico" sizes="any">
 <link rel="icon" type="image/png" href="/favicon-32x32.png">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
@@ -47,6 +51,7 @@
     </div>
     <button class="icon-btn only-mobile" id="search-toggle" aria-label="search"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg></button>
     <button class="icon-btn" id="theme" aria-label="toggle dark mode"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+    <a class="btn red create-btn" href="/create" aria-label="create bounty"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg><span>create bounty</span></a>
     <button class="btn white" id="connect">connect</button>
   </div>
 </header>
@@ -54,8 +59,8 @@
 <footer>
   <a href="/feed">activity</a> · <a href="/leaderboard">leaderboard</a> · <a href="https://docs.poidh.xyz" target="_blank" rel="noopener">docs</a> · <a href="https://x.com/poidhxyz" target="_blank" rel="noopener">x</a> · <a href="https://git.borodutch.com/backmeupplz/poidh" target="_blank" rel="noopener">source</a> · <a href="https://poidh.xyz" target="_blank" rel="noopener">poidh.xyz</a>
   <p>an alternative frontend for the poidh protocol. same contracts, same bounties.</p>
+  <div class="toggles"><button class="btn sm" id="theme2">dark mode</button><button class="btn sm" id="sound">sound: on</button></div>
 </footer>
-<a class="fab" id="fab" href="/create"><i class="orb" aria-hidden="true"></i><span>create bounty</span></a>
 <noscript><p class="wrap">poidh needs javascript to talk to the blockchain.</p></noscript>
 </body>
 </html>
