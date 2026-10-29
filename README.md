@@ -7,6 +7,7 @@ A lean frontend for [poidh](https://poidh.xyz) (pics or it didn't happen), live 
 - `/resolve` turns a claim's URI (metadata JSON, an image or a video) into its media. Results are kept in `DATA_DIR/media.jsonl`.
 - `/thumb` makes small webp thumbnails with libvips and caches them in `DATA_DIR/thumbs`.
 - `/upload` stores claim photos and videos by content hash in `DATA_DIR/uploads`; they are served from `/u/<sha256>.<ext>`.
+- zkPassport badges: `vendor/build.sh` bundles the pinned SDK into `public/vendor/` (loaded only when someone verifies; Barretenberg left out because poidh verifies proofs server-side).
 - Wallets are found through EIP-6963. Inside a Farcaster client the app is a mini app (`public/miniapp.js`, which talks the host protocol without the SDK) and uses the client's wallet. The manifest is at `/.well-known/farcaster.json`.
 
 Tests: `bun test` (needs nothing installed).

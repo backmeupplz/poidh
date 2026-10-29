@@ -1,0 +1,6 @@
+{
+  "name": "poidh-vendor",
+  "private": true,
+  "description": "Builds public/vendor/zkpassport.js (loaded only when someone verifies a passport). Run ./build.sh",
+  "dependencies": { "@zkpassport/sdk": "0.19.2", "qrcode-generator": "1.4.4" }
+}

@@ -1,0 +1,1 @@
+import{Fg as t}from"./zk-7sjdt8fx.js";var o=t(function(r,e){e.exports=function(){throw Error("ws does not work in the browser. Browser clients must use the native WebSocket object")}});export default o();

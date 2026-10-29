@@ -425,3 +425,5 @@ dialog.media img, dialog.media video { max-height: 90dvh; max-width: 96vw; borde
 @keyframes slide-up { from { transform: translateY(40px); opacity: 0; } }
 @media (min-width: 641px) { .only-mobile { display: none !important; } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }
+.qr { background: #fff; border-radius: var(--r-lg); padding: 14px; width: min(280px, 100%); margin: 0 auto; }
+.qr svg { display: block; width: 100%; height: auto; }

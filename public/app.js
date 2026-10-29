@@ -795,7 +795,7 @@ async function account(addr) {
   addr = lc(addr)
   const id = renderId
   const own = state.account === addr
-  app.innerHTML = `<div class="profile">${avatar(addr, 'av lg')}<div class="grow" style="min-width:0"><h1 id="pname">${esc(nameOf(addr))}</h1><div class="row dim wrapflex" style="font-size:12px"><span>${short(addr)}</span><button class="btn sm" id="copy">copy</button><span id="socials" class="row"></span></div></div></div>
+  app.innerHTML = `<div class="profile">${avatar(addr, 'av lg')}<div class="grow" style="min-width:0"><h1 id="pname">${esc(nameOf(addr))}</h1><div class="row dim wrapflex" style="font-size:12px"><span>${short(addr)}</span><button class="btn sm" id="copy">copy</button><span id="socials" class="row"></span></div><div id="zk" style="margin-top:8px"></div></div></div>
     <div class="statgrid" id="stats">${'<div class="stat skel" style="height:64px"></div>'.repeat(4)}</div>
     <div id="mine"></div>
     <div class="toolbar"><div class="tabs" id="tabs"><button class="on" data-t="bounties">bounties</button><button data-t="claims">claims</button><button data-t="nfts">collected</button></div></div>
@@ -823,6 +823,7 @@ async function account(addr) {
     ].map(([v, l]) => `<div class="stat"><b>${v}</b><span>${l}</span></div>`).join('')
   }).catch(() => ($('#stats').innerHTML = ''))
   if (own) ownerBox(addr)
+  passportBadge(addr, own)
   const tabs = {
     bounties: [(cursor) => q('accounts.bounties', { address: addr, limit: 12, ...(cursor ? { cursor } : {}) }), async (items) => { const p = await price(); return items.map((b) => bountyCard(b, p)).join('') }, 'grid'],
     claims: [(cursor) => q('accounts.claims', { address: addr, limit: 12, ...(cursor ? { cursor } : {}) }), async (items) => items.map(claimLink).join(''), 'claims'],
@@ -846,6 +847,58 @@ const claimLink = (c) => `<a class="claim" href="${bountyPath({ chainId: c.chain
   <div class="media" data-media data-src="${esc(c.url)}" data-alt="${esc(c.title)}" style="cursor:pointer"></div>
   ${c.isAccepted ? '<span class="pill white ribbon"><b>winner</b></span>' : ''}
   <div class="body"><h4>${esc(c.title)}</h4><p>${esc(plain(c.description).slice(0, 160))}</p><div class="meta">${chainDot(c.chainId)}<span class="dim">#${c.onChainId}</span></div></div></a>`
+
+// --- zkpassport: a nationality badge proven with zero knowledge -----------------
+async function passportBadge(addr, own) {
+  const st = await q('zkpassport.status', { address: addr }).catch(() => null)
+  const box = $('#zk')
+  if (!box) return
+  if (st?.verified) box.innerHTML = `<span class="pill white" title="nationality proven with zkpassport"><b>✓ passport verified</b>${st.country ? ` · ${esc(st.country)}` : ''}</span>`
+  else if (own) {
+    box.innerHTML = '<button class="btn sm" id="zkgo">verify your passport</button>'
+    $('#zkgo').onclick = (e) => act(e.currentTarget, () => verifyPassport(addr))
+    // the sdk takes a second to load and start, so begin on hover / touch
+    for (const ev of ['pointerenter', 'touchstart']) $('#zkgo').addEventListener(ev, () => import('./vendor/zkpassport.js?v=__V__'), { once: true, passive: true })
+  }
+}
+async function verifyPassport(addr) {
+  await authed(async () => {})
+  const { ZKPassport, qrcode } = await import('./vendor/zkpassport.js?v=__V__')
+  // proofs are bound to a domain; poidh's backend checks them against poidh.xyz
+  const zk = new ZKPassport('poidh.xyz')
+  const req = await zk.request({ name: 'poidh', logo: location.origin + '/icon.png', purpose: 'verify your nationality for your poidh profile badge', scope: 'poidh-profile-verification' })
+  const { url, requestId, onRequestReceived, onGeneratingProof, onSuccess, onReject, onError } = req.disclose('nationality').bind('user_address', addr).done()
+  const qr = qrcode(0, 'M')
+  qr.addData(url)
+  qr.make()
+  const d = sheet(`<h2>verify your passport</h2>
+    <p class="muted" style="margin:0">scan this with the zkpassport app. it proves your nationality with zero knowledge: nothing else from your passport leaves your phone. the app shows poidh.xyz as the requester, since poidh's backend checks the proof.</p>
+    <div class="qr">${qr.createSvgTag({ cellSize: 6, margin: 2, scalable: true })}</div>
+    <a class="btn white block" href="${esc(url)}">open zkpassport on this phone</a>
+    <p class="dim" id="zkst" style="margin:0;text-align:center">waiting for the app…</p>`)
+  let finished = false
+  d.addEventListener('close', () => !finished && zk.cancelRequest?.(requestId))
+  const status = (t) => $('#zkst', d) && ($('#zkst', d).textContent = t)
+  onRequestReceived(() => status('request received, follow the steps in the app…'))
+  onGeneratingProof(() => status('generating the proof on your phone…'))
+  onReject(() => { status('cancelled in the app'); finished = true })
+  onError((e) => { toast(String(e?.message || e), true); finished = true; d.close() })
+  onSuccess(async ({ proofs, result }) => {
+    status('checking the proof…')
+    try {
+      await authed(() => m('zkpassport.verify', { proofs, queryResult: result }))
+      finished = true
+      d.close()
+      done('passport verified!')
+      forget()
+      passportBadge(addr, true)
+    } catch (e) {
+      toast(e.code === 'CONFLICT' ? 'this passport is already linked to another wallet' : e.message, true)
+      finished = true
+      d.close()
+    }
+  })
+}
 
 async function ownerBox(addr) {
   const id = renderId
