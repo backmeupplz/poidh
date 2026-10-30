@@ -267,11 +267,126 @@ const manifest = (origin: string) => ({
 const embed = (url: string, image: string, title: string, type: 'launch_miniapp' | 'launch_frame') =>
   JSON.stringify({ version: type === 'launch_frame' ? 'next' : '1', imageUrl: image, button: { title, action: { type, name: 'poidh', url, splashImageUrl: new URL('/splash.png', url).href, splashBackgroundColor: '#2a81d5' } } })
 
+// --- share cards: our own og/embed images. librsvg draws the svg, pango draws user text (keeps color emoji) ---
+type Card = {
+  title: string; by?: string; byPic?: string; avatar?: string; photos?: string[]; photoLabel?: string
+  pills: [string, string?][]; stats: [string, string][]
+}
+const RED = '#d63a40', GREEN = '#13804f'
+const CARDS = `${DATA}/cards`
+mkdirSync(CARDS, { recursive: true })
+const SIZES = { og: [1200, 630], embed: [1200, 800] } as const
+const LOGO = (await Bun.file(DIR + 'logo.svg').text()).replace(/^<svg[^>]*>/, '').replace(/<\/svg>\s*$/, '')
+const xml = (s: string) => s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' })[c]!)
+const sha = (s: string) => new Bun.CryptoHasher('sha256').update(s).digest('hex')
+const pngSize = (b: Uint8Array) => [new DataView(b.buffer, b.byteOffset).getUint32(16), new DataView(b.buffer, b.byteOffset).getUint32(20)]
+const dataUri = async (file: string, type: string) => `data:${type};base64,${Buffer.from(await Bun.file(file).bytes()).toString('base64')}`
+
+// user text as a png: `size` px at most, shrunk (pango autofit) when it would be taller than maxH
+async function text(file: string, s: string, font: string, size: number, w: number, maxH: number, color = '#ffffff') {
+  const markup = `<span foreground="${color}">${xml(s)}</span>`
+  const run = (fit: string[]) => Bun.spawn(['vips', 'text', file, markup, '--font', `${font} ${size}`, '--width', String(w), '--wrap', 'word-char', '--rgba', ...fit], { stderr: 'ignore' }).exited
+  await run([])
+  let [tw, th] = pngSize(await Bun.file(file).bytes())
+  if (th > maxH) await run(['--height', String(maxH)]), ([tw, th] = pngSize(await Bun.file(file).bytes()))
+  return { w: tw, h: th, href: await dataUri(file, 'image/png') }
+}
+const thumbFile = async (u: string | undefined, size: number) => (u && /^https?:/.test(u) && (await makeThumb(u, size)) ? `${THUMBS}/${thumbName(u, size)}` : undefined)
+async function photoFor(urls: string[]) {
+  const found = await Promise.all(urls.map(mediaFor))
+  for (const m of found) if (m && !m.video && !/\.gif(\?|$)/i.test(m.src)) { const f = await thumbFile(m.src, 640); if (f) return f }
+}
+
+const drawing = new Map<string, Promise<string>>()
+const cardKey = (card: Card, fmt: string) => sha(VERSION + fmt + JSON.stringify(card)).slice(0, 24)
+function drawCard(card: Card, fmt: keyof typeof SIZES): Promise<string> {
+  const key = cardKey(card, fmt)
+  const out = `${CARDS}/${key}.jpg`
+  // ponytail: rendered cards are never pruned (~100 kb each), add a sweep if the volume fills up
+  if (!drawing.has(key))
+    drawing.set(key, (async () => {
+      if (await Bun.file(out).exists()) return out
+      const [W, H] = SIZES[fmt], P = 64, tmp = `${CARDS}/${key}-`
+      const [photo, avatar, byPic] = await Promise.all([photoFor(card.photos || []), thumbFile(card.avatar, 640), thumbFile(card.byPic, 96)])
+      const pic = photo || avatar
+      const picSize = !pic ? 0 : avatar ? (fmt === 'og' ? 300 : 380) : fmt === 'og' ? 440 : 540
+      const textW = W - 2 * P - (pic ? picSize + 56 : 0)
+      const svg: string[] = []
+      // logo + pills
+      svg.push(`<svg x="${P}" y="${P}" width="137" height="52" viewBox="0 0 100 38" fill="none">${LOGO}</svg>`)
+      let x = P + 137 + 24
+      for (const [label, fill] of card.pills) {
+        const w = Math.round(label.length * 13.2 + 36)
+        svg.push(`<rect x="${x}" y="${P + 6}" width="${w}" height="40" rx="20" fill="${fill || 'rgb(6,32,74)'}" fill-opacity="${fill ? 1 : 0.32}" stroke="#fff" stroke-opacity="${fill ? 0 : 0.22}"/>`,
+          `<text x="${x + w / 2}" y="${P + 33}" text-anchor="middle" font-family="Geist Mono" font-size="22" fill="#fff">${xml(label)}</text>`)
+        x += w + 12
+      }
+      // stats along the bottom, dropping the last ones that don't fit
+      const statY = H - P - 108
+      let sx = P
+      for (const [value, label] of card.stats) {
+        const w = Math.round(Math.max(value.length * 27.6, label.length * 13.2) + 52)
+        if (sx + w > P + textW) break
+        svg.push(`<rect x="${sx}" y="${statY}" width="${w}" height="108" rx="20" fill="rgb(6,32,74)" fill-opacity="0.32" stroke="#fff" stroke-opacity="0.22"/>`,
+          `<text x="${sx + 26}" y="${statY + 58}" font-family="Geist Mono" font-weight="700" font-size="46" fill="#fff">${xml(value)}</text>`,
+          `<text x="${sx + 26}" y="${statY + 90}" font-family="Geist Mono" font-size="22" fill="#fff" fill-opacity="0.8">${xml(label)}</text>`)
+        sx += w + 16
+      }
+      // title, then the byline under it
+      const titleY = P + 52 + 48
+      const byH = card.by ? 64 : 0
+      const t = await text(tmp + 't.png', card.title.toLowerCase(), 'Geist Mono Bold', 68, textW, statY - 40 - byH - titleY)
+      svg.push(`<image x="${P}" y="${titleY}" width="${t.w}" height="${t.h}" href="${t.href}"/>`)
+      if (card.by) {
+        const bx = P + (byPic ? 52 : 0), by = titleY + t.h + 30
+        const b = await text(tmp + 'b.png', card.by.toLowerCase(), 'Geist Mono', 28, textW - (bx - P), 40, '#dbe8f7')
+        if (byPic) svg.push(`<clipPath id="bp"><circle cx="${P + 20}" cy="${by + b.h / 2}" r="20"/></clipPath>`,
+          `<image x="${P}" y="${by + b.h / 2 - 20}" width="40" height="40" preserveAspectRatio="xMidYMid slice" clip-path="url(#bp)" href="${await dataUri(byPic, 'image/webp')}"/>`)
+        svg.push(`<image x="${bx}" y="${by}" width="${b.w}" height="${b.h}" href="${b.href}"/>`)
+      }
+      // the claim pic as a tilted print, or the avatar in a ring
+      if (pic) {
+        const px = W - P - picSize, py = (H - picSize) / 2, href = await dataUri(pic, 'image/webp')
+        if (avatar && !photo)
+          svg.push(`<circle cx="${px + picSize / 2}" cy="${H / 2}" r="${picSize / 2}" fill="#fff" filter="url(#sh)"/>`,
+            `<clipPath id="av"><circle cx="${px + picSize / 2}" cy="${H / 2}" r="${picSize / 2 - 10}"/></clipPath>`,
+            `<image x="${px}" y="${py}" width="${picSize}" height="${picSize}" preserveAspectRatio="xMidYMid slice" clip-path="url(#av)" href="${href}"/>`)
+        else {
+          const label = card.photoLabel || '', lw = Math.round(label.length * 13.2 + 36)
+          svg.push(`<g transform="rotate(3 ${px + picSize / 2} ${H / 2})"><rect x="${px}" y="${py}" width="${picSize}" height="${picSize}" rx="24" fill="#fff" filter="url(#sh)"/>`,
+            `<clipPath id="ph"><rect x="${px + 12}" y="${py + 12}" width="${picSize - 24}" height="${picSize - 24}" rx="14"/></clipPath>`,
+            `<image x="${px + 12}" y="${py + 12}" width="${picSize - 24}" height="${picSize - 24}" preserveAspectRatio="xMidYMid slice" clip-path="url(#ph)" href="${href}"/>`,
+            label && `<rect x="${px + 28}" y="${py + picSize - 68}" width="${lw}" height="40" rx="20" fill="${card.photoLabel === 'winning pic' ? GREEN : RED}"/><text x="${px + 28 + lw / 2}" y="${py + picSize - 41}" text-anchor="middle" font-family="Geist Mono" font-size="22" fill="#fff">${xml(label)}</text>`,
+            `</g>`)
+        }
+      }
+      const doc = `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}"><defs>
+<linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#1f6fc0"/><stop offset="0.45" stop-color="#4b91da"/><stop offset="0.6" stop-color="#5294dc"/><stop offset="1" stop-color="#1f6fc0"/></linearGradient>
+<radialGradient id="glow" cx="0.3" cy="0.2" r="0.8"><stop offset="0" stop-color="#fff" stop-opacity="0.16"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></radialGradient>
+<filter id="sh" x="-20%" y="-20%" width="140%" height="150%"><feDropShadow dx="0" dy="18" stdDeviation="22" flood-color="#04183c" flood-opacity="0.45"/></filter>
+</defs><rect width="${W}" height="${H}" fill="url(#bg)"/><rect width="${W}" height="${H}" fill="url(#glow)"/>${svg.join('')}</svg>`
+      await Bun.write(tmp + 'card.svg', doc)
+      await Bun.spawn(['vips', 'copy', tmp + 'card.svg', `${out}[Q=88,strip]`], { stderr: 'ignore' }).exited
+      for (const f of ['t.png', 'b.png', 'card.svg']) await Bun.file(tmp + f).delete().catch(() => {})
+      if (!(await Bun.file(out).exists())) throw new Error('card render failed')
+      return out
+    })().finally(() => drawing.delete(key)))
+  return drawing.get(key)!
+}
+// GET /og/<page path>?f=og|embed: the share card for that page
+async function cardImage(req: Request, url: URL) {
+  const meta = await metaFor(req, new URL(url.pathname.slice(3) || '/', url.origin)).catch(() => undefined)
+  const fmt = url.searchParams.get('f') === 'embed' ? 'embed' : 'og'
+  const file = meta?.card && (await drawCard(meta.card, fmt).catch(() => undefined))
+  if (!file) return Response.redirect(`${url.origin}/${fmt === 'embed' ? 'embed' : 'og'}.png`, 302)
+  return new Response(Bun.file(file), { headers: { 'content-type': 'image/jpeg', 'cache-control': 'public, max-age=3600' } })
+}
+
 // --- HTML shell with per-page meta -------------------------------------------
 const esc = (s: string) => s.replace(/[&<>"]/g, (c) => `&#${c.charCodeAt(0)};`)
 const CHAINS: Record<string, number> = { mainnet: 1, arbitrum: 42161, base: 8453 }
 
-type Meta = { title: string; desc: string; image?: string; embed?: string; button?: string }
+type Meta = { title: string; desc: string; card?: Card; button?: string }
 const DEFAULT_DESC = 'social bounties for fun. post a bounty with eth, anyone can claim it with a pic, and the best proof gets paid onchain.'
 const STATIC: Record<string, Meta> = {
   '/': { title: "poidh - pics or it didn't happen", desc: DEFAULT_DESC },
@@ -289,47 +404,65 @@ async function metaFor(req: Request, url: URL): Promise<Meta> {
     const hit = cache.get(key) ?? (await fetchInto(key, req))
     return JSON.parse(new TextDecoder().decode(hit.asset.body))[0]?.result?.data?.json
   }
-  const og = (path: string, params: Record<string, string>, format: string) => `${url.origin}/api/og/${path}?${new URLSearchParams(params)}&imageFormat=${format}`
+  const person = async (address: string) => {
+    const [users, name] = await Promise.all([get('neynar.usersData', { addresses: [address] }), get('web3.fetchHumanReadableName', { address })])
+    const u = users?.[0]
+    return { who: String(u?.farcasterTag || u?.gwei || u?.wei || u?.ens || u?.degenName || name || `${address.slice(0, 6)}…${address.slice(-4)}`), pic: u?.pfpUrl as string | undefined }
+  }
   let m
   if ((m = url.pathname.match(/^\/(mainnet|arbitrum|base)\/bounty\/(\d+)\/?$/))) {
     const chainId = CHAINS[m[1]]
-    const [b, price, parts] = await Promise.all([
+    const [b, price, parts, claims] = await Promise.all([
       get('bounties.fetch', { id: Number(m[2]), chainId }),
       get('web3.fetchPrice', { currency: 'eth' }),
       get('bounties.participations', { bountyId: Number(m[2]), chainId }),
+      get('claims.fetchBountyClaims', { bountyId: Number(m[2]), chainId, limit: 9 }),
     ])
     if (!b?.title) return STATIC['/']
     const eth = Number(BigInt(b.amount)) / 1e18
-    const params = {
-      title: String(b.title).slice(0, 100), amount: String(b.amount), chainId: String(chainId), currencyRate: String(price || 0),
-      participants: (parts || []).map((p: { userAddress: string }) => p.userAddress).join(','),
-    }
+    const items: { url: string; isAccepted: boolean }[] = claims?.items || []
+    const nClaims = items.length + (claims?.nextCursor ? '+' : '')
+    const status = b.isCanceled ? 'cancelled' : !b.inProgress ? 'paid out' : b.isVoting ? 'voting' : 'open for claims'
+    const by = await person(String(b.issuer).toLowerCase())
     return {
       title: `${b.title} | poidh`,
       desc: cut(`${+eth.toFixed(5)} eth${price ? ` ($${(eth * price).toFixed(2)})` : ''} bounty${b.inProgress ? ', open for claims' : ''}. ${clean(b.description)}`, 200),
-      image: og('bounty', params, 'og'), embed: og('bounty', params, 'preview'), button: b.inProgress ? 'view bounty' : 'see the winner',
+      card: {
+        title: cut(String(b.title), 140), by: `by ${by.who}`, byPic: by.pic,
+        pills: [[m[1] === 'mainnet' ? 'ethereum' : m[1]], [status, { voting: RED, 'open for claims': GREEN, 'paid out': GREEN }[status]]],
+        stats: [
+          [`${+eth.toFixed(5)} eth`, price ? `$${(eth * price).toFixed(2)}` : 'bounty'],
+          [nClaims, nClaims == 1 ? 'claim' : 'claims'],
+          ...(b.isMultiplayer ? [[String(parts?.length || 1), parts?.length == 1 ? 'contributor' : 'contributors'] as [string, string]] : []),
+        ],
+        // the winner first, then the newest claims
+        photos: [...items.filter((c) => c.isAccepted), ...items.filter((c) => !c.isAccepted)].map((c) => c.url),
+        photoLabel: items.some((c) => c.isAccepted) ? 'winning pic' : 'latest claim',
+      },
+      button: b.inProgress ? 'view bounty' : 'see the winner',
     }
   }
   if ((m = url.pathname.match(/^\/account\/(0x[0-9a-fA-F]{40})\/?$/))) {
     const address = m[1].toLowerCase()
-    const [users, name, stats, counts] = await Promise.all([
-      get('neynar.usersData', { addresses: [address] }), get('web3.fetchHumanReadableName', { address }),
-      get('accounts.stats', { address }), get('accounts.activitiesCount', { address }),
-    ])
-    const u = users?.[0]
-    const who = u?.farcasterTag || u?.gwei || u?.wei || u?.ens || u?.degenName || name || `${address.slice(0, 6)}…${address.slice(-4)}`
-    const params = { address, poidhScore: String(stats?.poidhScore ?? 0), totalBounties: String(counts?.bounties ?? 0), totalClaims: String(counts?.claims ?? 0) }
+    const [{ who, pic }, stats, counts] = await Promise.all([person(address), get('accounts.stats', { address }), get('accounts.activitiesCount', { address })])
+    const earned = `$${(stats?.eth?.totalEarn?.amountUSD ?? 0).toFixed(2)}`
     return {
       title: `${who} | poidh`,
-      desc: `${who} on poidh: ${Number(stats?.poidhScore || 0).toLocaleString()} poidh score, ${counts?.bounties ?? 0} bounties, ${counts?.claims ?? 0} claims, $${(stats?.eth?.totalEarn?.amountUSD ?? 0).toFixed(2)} earned.`,
-      image: og('account', params, 'og'), embed: og('account', params, 'preview'), button: 'view profile',
+      desc: `${who} on poidh: ${Number(stats?.poidhScore || 0).toLocaleString()} poidh score, ${counts?.bounties ?? 0} bounties, ${counts?.claims ?? 0} claims, ${earned} earned.`,
+      card: {
+        title: who, by: `${address.slice(0, 6)}…${address.slice(-4)}`, avatar: pic, pills: [['profile']],
+        stats: [[Number(stats?.poidhScore || 0).toLocaleString('en-US'), 'poidh score'], [String(counts?.bounties ?? 0), 'bounties'], [String(counts?.claims ?? 0), 'claims'], [earned, 'earned']],
+      },
+      button: 'view profile',
     }
   }
   if ((m = url.pathname.match(/^\/a\/([^/]+)\/?$/))) {
     const album = decodeURIComponent(m[1]).toLowerCase().slice(0, 40)
+    const c = await get('bounties.fetchAlbumCounts', { album })
     return {
       title: `#${album} bounties | poidh`, desc: `${album} bounties on poidh: see the open ones, the votes in progress and the past winners.`,
-      image: og('album', { album }, 'og'), embed: og('album', { album }, 'preview'), button: `see #${album}`,
+      card: { title: `#${album}`, by: 'bounties on poidh', pills: [['album']], stats: [[String(c?.open ?? 0), 'open'], [String(c?.progress ?? 0), 'voting'], [String(c?.past ?? 0), 'past']] },
+      button: `see #${album}`,
     }
   }
   return STATIC[url.pathname.replace(/\/+$/, '') || '/'] || STATIC['/']
@@ -341,10 +474,11 @@ async function page(req: Request, url: URL) {
   const crawler = CRAWLER.test(ua) || !/mozilla/i.test(ua)
   const known = STATIC[url.pathname.replace(/\/+$/, '') || '/']
   const meta = known || !crawler ? known || STATIC['/'] : await metaFor(req, url).catch(() => STATIC['/'])
-  const image = meta.image || url.origin + '/og.png'
-  const embedImage = meta.embed || url.origin + '/embed.png'
-  // warm poidh's slow image renders (up to ~10 s) so the crawler's follow-up fetch is instant
-  for (const i of [meta.image, meta.embed]) if (i && !cache.has(new URL(i).pathname + new URL(i).search)) fetchInto(new URL(i).pathname + new URL(i).search, req).catch(() => {})
+  const card = (f: 'og' | 'embed') => `${url.origin}/og${url.pathname}?${f === 'embed' ? 'f=embed&' : ''}v=${cardKey(meta.card!, f).slice(0, 10)}`
+  const image = meta.card ? card('og') : url.origin + '/og.png'
+  const embedImage = meta.card ? card('embed') : url.origin + '/embed.png'
+  // draw the cards now so the crawler's follow-up image fetch is instant
+  if (meta.card) for (const f of ['og', 'embed'] as const) drawCard(meta.card, f).catch(() => {})
   const here = url.origin + url.pathname
   const html = shell
     .replaceAll('__TITLE__', esc(meta.title))
@@ -365,6 +499,7 @@ Bun.serve({
     if (url.pathname.startsWith('/api/')) return proxy(req, url).catch(() => new Response('upstream error', { status: 502 }))
     if (url.pathname === '/resolve') return resolve(req, url)
     if (url.pathname === '/thumb') return thumb(req, url)
+    if (url.pathname.startsWith('/og/')) return cardImage(req, url)
     if (url.pathname === '/upload' && req.method === 'POST') return upload(req, url)
     if (url.pathname.startsWith('/u/')) return uploaded(url.pathname.slice(3))
     if (url.pathname === '/.well-known/farcaster.json') return Response.json(manifest(url.origin), { headers: { 'access-control-allow-origin': '*' } })

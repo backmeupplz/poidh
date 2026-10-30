@@ -1,5 +1,6 @@
 FROM oven/bun:1.4.4-alpine
-RUN apk add --no-cache vips-tools
+RUN apk add --no-cache vips-tools font-noto-emoji
+COPY fonts /usr/share/fonts/geist
 WORKDIR /app
 COPY server.ts ./
 COPY public ./public
