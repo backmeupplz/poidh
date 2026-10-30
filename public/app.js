@@ -796,10 +796,16 @@ async function create(params) {
     if (btn) pick(seg, btn.dataset.v)
   }
   bindAmount(app, p)
-  const me = state.account
-  if (!d && me) fetch(`/api/bounty-drafts?creator=${me}`).then((r) => r.json()).then((r) => {
-    const n = r.drafts?.length
-    if (n && state.account === me && location.pathname === '/create') $('.lead', app).insertAdjacentHTML('afterend', `<a class="btn sm" style="margin-top:10px" href="/account/${me}?tab=drafts">your drafts (${n}${r.nextOffset != null && n >= 20 ? '+' : ''})</a>`)
+  // your drafts at the bottom; picking one loads it into the form
+  const me = state.account, id = renderId
+  if (me) fetch(`/api/bounty-drafts?creator=${me}`).then((r) => r.json()).then((r) => {
+    const list = r.drafts || [], more = list.length >= 20
+    if (!list.length || id !== renderId) return
+    $('.form', app).insertAdjacentHTML('beforeend', `<div class="sec" id="drafts"><h2>your drafts</h2>${more ? `<a href="/account/${me}?tab=drafts">see all</a>` : ''}</div>
+      <div class="grid">${list.map((x) => draftCard(x, p, `/create?draft=${encodeURIComponent(x.cid)}`)).join('')}</div>`)
+    if (d) return
+    $('.lead', app).insertAdjacentHTML('afterend', `<button class="btn sm" style="margin-top:10px">your drafts (${list.length}${more ? '+' : ''})</button>`)
+    $('.lead + button', app).onclick = () => $('#drafts').scrollIntoView({ behavior: 'smooth' })
   }, () => {})
   if (d) {
     $('#t').value = d.title
@@ -881,7 +887,7 @@ async function draftPage(cid) {
   hydratePeople()
   $('#share').onclick = () => share(d.title, `${location.origin}/d/${cid}`)
 }
-const draftCard = (d, p) => `<a class="card" href="/d/${esc(d.cid)}">
+const draftCard = (d, p, href = `/d/${d.cid}`) => `<a class="card" href="${esc(href)}">
     <div class="row between"><span class="badge red">draft</span><span class="dim" style="font-size:11px">${ago(d.createdAt)}</span></div>
     <h3>${esc(d.title)}</h3>
     <div class="foot"><span class="amount">${esc(d.amount)} eth${p ? ` <small>${fmtUsd(+d.amount * p)}</small>` : ''}</span><span class="row dim" style="font-size:11px;gap:6px">${chainDot(BY_SLUG[d.chain]?.id)}${chainOf(BY_SLUG[d.chain]?.id).label}</span></div>
