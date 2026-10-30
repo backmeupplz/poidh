@@ -278,6 +278,7 @@ async function autoConnect() {
 function accountMenu() {
   const d = sheet(`<div class="row">${avatar(state.account, 'av lg')}<div class="grow"><h2 class="ellipsis">${esc(nameOf(state.account))}</h2><div class="dim ellipsis">${esc(state.account)}</div></div></div>
     <a class="btn block" href="/account/${state.account}">your profile</a>
+    <a class="btn block" href="/account/${state.account}?tab=drafts">your drafts</a>
     ${state.mini ? '' : '<button class="btn block" id="dc">disconnect</button>'}`)
   $$('a', d).forEach((a) => a.addEventListener('click', () => d.close()))
   $('#dc', d)?.addEventListener('click', () => {
@@ -795,6 +796,11 @@ async function create(params) {
     if (btn) pick(seg, btn.dataset.v)
   }
   bindAmount(app, p)
+  const me = state.account
+  if (!d && me) fetch(`/api/bounty-drafts?creator=${me}`).then((r) => r.json()).then((r) => {
+    const n = r.drafts?.length
+    if (n && state.account === me && location.pathname === '/create') $('.lead', app).insertAdjacentHTML('afterend', `<a class="btn sm" style="margin-top:10px" href="/account/${me}?tab=drafts">your drafts (${n}${r.nextOffset != null && n >= 20 ? '+' : ''})</a>`)
+  }, () => {})
   if (d) {
     $('#t').value = d.title
     $('#ds').value = d.description
@@ -881,7 +887,7 @@ const draftCard = (d, p) => `<a class="card" href="/d/${esc(d.cid)}">
     <div class="foot"><span class="amount">${esc(d.amount)} eth${p ? ` <small>${fmtUsd(+d.amount * p)}</small>` : ''}</span><span class="row dim" style="font-size:11px;gap:6px">${chainDot(BY_SLUG[d.chain]?.id)}${chainOf(BY_SLUG[d.chain]?.id).label}</span></div>
   </a>`
 
-async function account(addr) {
+async function account(addr, params) {
   if (!/^0x[0-9a-fA-F]{40}$/.test(addr)) return notFound()
   addr = lc(addr)
   const id = renderId
@@ -889,7 +895,7 @@ async function account(addr) {
   app.innerHTML = `<div class="profile">${avatar(addr, 'av lg')}<div class="grow" style="min-width:0"><h1 id="pname">${esc(nameOf(addr))}</h1><div class="row dim wrapflex" style="font-size:12px"><span>${short(addr)}</span><button class="btn sm" id="copy">copy</button><span id="socials" class="row"></span></div><div id="zk" style="margin-top:8px"></div></div></div>
     <div class="statgrid" id="stats">${'<div class="stat skel" style="height:64px"></div>'.repeat(4)}</div>
     <div id="mine"></div>
-    <div class="toolbar"><div class="tabs" id="tabs"><button class="on" data-t="bounties">bounties</button><button data-t="claims">claims</button><button data-t="nfts">collected</button><button data-t="drafts">drafts</button></div></div>
+    <div class="toolbar"><div class="tabs" id="tabs"><button data-t="bounties">bounties</button><button data-t="claims">claims</button><button data-t="nfts">collected</button><button data-t="drafts">drafts</button></div></div>
     <div id="list"></div>`
   $('#copy').onclick = () => navigator.clipboard.writeText(addr).then(() => done('address copied'))
   Promise.all([q('neynar.usersData', { addresses: [addr] }).catch(() => []), q('web3.fetchHumanReadableName', { address: addr }).catch(() => null)]).then(([u, n]) => {
@@ -933,7 +939,9 @@ async function account(addr) {
     $$('#tabs button').forEach((x) => x.classList.toggle('on', x === btn))
     show(btn.dataset.t)
   }
-  infinite($('#list').appendChild(Object.assign(document.createElement('div'), { className: 'grid' })), tabs.bounties[0], tabs.bounties[1])
+  const first = tabs[params?.get('tab')] ? params.get('tab') : 'bounties'
+  $$('#tabs button').forEach((x) => x.classList.toggle('on', x.dataset.t === first))
+  infinite($('#list').appendChild(Object.assign(document.createElement('div'), { className: tabs[first][2] })), tabs[first][0], tabs[first][1])
 }
 const claimLink = (c) => `<a class="claim" href="${bountyPath({ chainId: c.chainId, bountyId: c.bountyId })}" style="text-decoration:none">
   <div class="media" data-media data-src="${esc(c.url)}" data-alt="${esc(c.title)}" style="cursor:pointer"></div>
@@ -1201,7 +1209,7 @@ async function route(params) {
       return await home(params)
     }
     if ((m = path.match(/^\/(mainnet|arbitrum|base|degen)\/bounty\/(\d+)$/))) return await bountyPage(m[1], +m[2], params)
-    if ((m = path.match(/^\/account\/([^/]+)$/))) return await account(m[1])
+    if ((m = path.match(/^\/account\/([^/]+)$/))) return await account(m[1], params)
     if ((m = path.match(/^\/a\/([^/]+)$/))) return await album(m[1], params)
     if (path === '/create') return await create(params)
     if ((m = path.match(/^\/d\/([a-z2-7]+)$/))) return await draftPage(m[1])
