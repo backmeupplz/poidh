@@ -773,45 +773,113 @@ function claimForm(b) {
   })
 }
 
-async function create() {
-  const p = await price()
+async function create(params) {
+  const cid = params?.get('draft')
+  const [p, d] = await Promise.all([price(), cid && fetch('/draft/' + encodeURIComponent(cid)).then((r) => (r.ok ? r.json() : null), () => null)])
   app.innerHTML = `<a class="back" href="/">← all bounties</a>
   <div class="form">
-    <div><h1 class="page-title">create a bounty</h1><p class="lead" style="margin:0">describe what you want to see. put up eth. the best pic wins.</p></div>
-    <label class="field">title<input class="inp" id="t" maxlength="100" placeholder="e.g. take a pic of a cat wearing a tiny hat"></label>
+    <div><h1 class="page-title">create a bounty</h1><p class="lead" style="margin:0">${d ? `from a <a href="/d/${esc(cid)}">draft</a> by ${who(d.creator)}` : 'describe what you want to see. put up eth. the best pic wins.'}</p></div>
+    <label class="field">title<input class="inp" id="t" maxlength="200" placeholder="e.g. take a pic of a cat wearing a tiny hat"></label>
     <label class="field">description<textarea id="ds" rows="8" placeholder="what counts as proof? any rules or deadline? markdown works."></textarea></label>
     <div class="field">type<div class="seg" id="type"><button class="on" data-v="solo">solo · you pick the winner</button><button data-v="open">open · others can add funds</button></div></div>
     <div class="field">network<div class="seg" id="net">${LIVE.map((id, i) => `<button class="${i ? '' : 'on'}" data-v="${id}">${CHAINS[id].label}</button>`).join('')}</div></div>
     ${amountField(p)}
-    <label class="field">album (optional)<input class="inp" id="al" maxlength="40" placeholder="e.g. art, research, halloween"></label>
+    <label class="field">album (optional)<input class="inp" id="al" maxlength="30" placeholder="e.g. art, research, halloween"></label>
     <button class="btn red block" id="go">create bounty</button>
-    <p class="dim" style="font-size:11px;margin:0">the eth sits in the poidh contract until you accept a claim or cancel. poidh takes a 2.5% fee on payout. open bounties with outside contributors pick winners by a 48 hour vote.</p>
+    <button class="btn block" id="save">or save as a draft</button>
+    <p class="dim" style="font-size:11px;margin:0">the eth sits in the poidh contract until you accept a claim or cancel. poidh takes a 2.5% fee on payout. open bounties with outside contributors pick winners by a 48 hour vote. a draft is a free public link anyone can post as a bounty later.</p>
   </div>`
+  const pick = (seg, v) => $$('button', seg).forEach((x) => x.classList.toggle('on', x.dataset.v === String(v)))
   for (const seg of $$('.seg', app)) seg.onclick = (e) => {
     const btn = e.target.closest('button')
-    if (!btn) return
-    $$('button', seg).forEach((x) => x.classList.toggle('on', x === btn))
+    if (btn) pick(seg, btn.dataset.v)
   }
   bindAmount(app, p)
-  $('#go').onclick = (e) => act(e.currentTarget, async () => {
+  if (d) {
+    $('#t').value = d.title
+    $('#ds').value = d.description
+    $('#amt').value = d.amount
+    $('#al').value = d.album
+    pick($('#type'), d.isOpenBounty ? 'open' : 'solo')
+    pick($('#net'), BY_SLUG[d.chain].id)
+    $('#amt').oninput({ target: $('#amt') })
+    hydratePeople()
+  }
+  const read = () => {
     const title = $('#t').value.trim()
     const description = $('#ds').value.trim()
     if (!title) throw new Error('give your bounty a title')
     if (!description) throw new Error('describe what counts as proof')
-    const wei = readAmount(app)
-    const open = $('#type .on').dataset.v === 'open'
-    const chainId = +$('#net .on').dataset.v
+    const album = $('#al').value.trim().toLowerCase()
+    if (album && !/^[a-z]+(-[a-z]+)*$/.test(album)) throw new Error('albums are lowercase words joined by hyphens, like tiny-hats')
+    return { title, description, wei: readAmount(app), amount: $('#amt').value.trim().replace(',', '.').replace(/^\./, '0.'), open: $('#type .on').dataset.v === 'open', chainId: +$('#net .on').dataset.v, album }
+  }
+  $('#go').onclick = (e) => act(e.currentTarget, async () => {
+    const { title, description, wei, open, chainId, album } = read()
     const receipt = await send(chainId, encode(open ? SEL.createOpenBounty : SEL.createSoloBounty, ['string', 'string'], [title, description]), wei, 'bounty')
     const log = receipt.logs.find((l) => l.topics?.[0] === BOUNTY_CREATED && lc(l.address) === lc(CHAINS[chainId].contract))
     const onChainId = log ? Number(BigInt(log.topics[1])) : null
     done('bounty created! indexing…')
     const row = onChainId != null && (await poll(() => q('bounties.isNewlyCreated', { chainId, id: onChainId }, { fresh: true })))
     if (!row) return go('/')
-    const album = $('#al').value.trim().toLowerCase()
     if (album) await m('bounties.addToAlbum', { bountyId: row.id, chainId, album }).catch(() => {})
     go(`/${CHAINS[chainId].slug}/bounty/${row.id}?new=1`)
   })
+  // poidh pins the draft to IPFS under the signed-in wallet
+  $('#save').onclick = (e) => {
+    const btn = e.currentTarget
+    let f
+    try { f = read() } catch (err) { return toast(err.message, true) }
+    confirmSheet('save a public draft?', 'anyone with the link can see it and post it as a bounty, and it shows your wallet address. nothing is paid now.', 'save draft', () => act(btn, async () => {
+      const body = JSON.stringify({ title: f.title, description: f.description, amount: f.amount, chain: CHAINS[f.chainId].slug, isOpenBounty: f.open, album: f.album })
+      const r = await authed(async () => {
+        const r = await fetch('/api/bounty-drafts', { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body })
+        const j = await r.json().catch(() => ({}))
+        if (r.status === 401) throw Object.assign(new Error('sign in again'), { code: 'UNAUTHORIZED' })
+        if (!r.ok || !j.cid) throw new Error(j.error?.toLowerCase() || 'could not save the draft')
+        return j
+      })
+      done('draft saved')
+      share(f.title, `${location.origin}/d/${r.cid}`, 'your draft is public. anyone with this link can post it as a bounty.')
+    }))
+  }
 }
+
+async function draftPage(cid) {
+  const id = renderId
+  app.innerHTML = `<div class="skel" style="height:44px;width:60%;margin:20px 0"></div><div class="skel" style="height:300px"></div>`
+  const [d, p] = await Promise.all([fetch('/draft/' + cid).then((r) => (r.ok ? r.json() : null), () => null), price()])
+  if (id !== renderId) return
+  if (!d) return notFound('draft not found')
+  document.title = `${d.title} (draft) | poidh`
+  const chain = BY_SLUG[d.chain]
+  app.innerHTML = `
+    <a class="back" href="/">← all bounties</a>
+    <div class="bounty">
+      <header class="bhead">
+        <h1>${esc(d.title)}</h1>
+        <div class="row wrapflex muted" style="font-size:12px">${who(d.creator)}<span>·</span><span>${ago(d.createdAt)}</span>${d.album ? `<span>·</span><a href="/a/${esc(encodeURIComponent(d.album))}" class="pill">#${esc(d.album)}</a>` : ''}</div>
+      </header>
+      <div class="bmain"><div class="panel"><div class="md">${md(d.description)}</div></div></div>
+      <aside class="side">
+        <div class="panel" style="display:flex;flex-direction:column;gap:12px">
+          <div class="row between"><span class="pill red">draft</span><span class="row dim" style="font-size:12px">${chainDot(chain.id)} ${chain.label}</span></div>
+          <div><div class="big-amt">${esc(d.amount)} eth</div><div class="muted">${p ? fmtUsd(+d.amount * p) : ''}</div></div>
+          <a class="btn red block" href="/create?draft=${cid}">create this bounty</a>
+          <dl class="kv"><dt>type</dt><dd>${d.isOpenBounty ? 'open bounty (anyone can add funds)' : 'solo bounty'}</dd></dl>
+          <p class="dim" style="font-size:11px;margin:0">a draft is a saved bounty idea. nothing is paid yet: whoever creates it puts up the eth and picks the winner.</p>
+          <div class="row"><button class="btn sm grow" id="share">share</button><a class="btn sm grow" href="https://poidh.xyz/d/${cid}" target="_blank" rel="noopener">poidh.xyz ↗</a></div>
+        </div>
+      </aside>
+    </div>`
+  hydratePeople()
+  $('#share').onclick = () => share(d.title, `${location.origin}/d/${cid}`)
+}
+const draftCard = (d, p) => `<a class="card" href="/d/${esc(d.cid)}">
+    <div class="row between"><span class="badge red">draft</span><span class="dim" style="font-size:11px">${ago(d.createdAt)}</span></div>
+    <h3>${esc(d.title)}</h3>
+    <div class="foot"><span class="amount">${esc(d.amount)} eth${p ? ` <small>${fmtUsd(+d.amount * p)}</small>` : ''}</span><span class="row dim" style="font-size:11px;gap:6px">${chainDot(BY_SLUG[d.chain]?.id)}${chainOf(BY_SLUG[d.chain]?.id).label}</span></div>
+  </a>`
 
 async function account(addr) {
   if (!/^0x[0-9a-fA-F]{40}$/.test(addr)) return notFound()
@@ -821,7 +889,7 @@ async function account(addr) {
   app.innerHTML = `<div class="profile">${avatar(addr, 'av lg')}<div class="grow" style="min-width:0"><h1 id="pname">${esc(nameOf(addr))}</h1><div class="row dim wrapflex" style="font-size:12px"><span>${short(addr)}</span><button class="btn sm" id="copy">copy</button><span id="socials" class="row"></span></div><div id="zk" style="margin-top:8px"></div></div></div>
     <div class="statgrid" id="stats">${'<div class="stat skel" style="height:64px"></div>'.repeat(4)}</div>
     <div id="mine"></div>
-    <div class="toolbar"><div class="tabs" id="tabs"><button class="on" data-t="bounties">bounties</button><button data-t="claims">claims</button><button data-t="nfts">collected</button></div></div>
+    <div class="toolbar"><div class="tabs" id="tabs"><button class="on" data-t="bounties">bounties</button><button data-t="claims">claims</button><button data-t="nfts">collected</button><button data-t="drafts">drafts</button></div></div>
     <div id="list"></div>`
   $('#copy').onclick = () => navigator.clipboard.writeText(addr).then(() => done('address copied'))
   Promise.all([q('neynar.usersData', { addresses: [addr] }).catch(() => []), q('web3.fetchHumanReadableName', { address: addr }).catch(() => null)]).then(([u, n]) => {
@@ -851,6 +919,7 @@ async function account(addr) {
     bounties: [(cursor) => q('accounts.bounties', { address: addr, limit: 12, ...(cursor ? { cursor } : {}) }), async (items) => { const p = await price(); return items.map((b) => bountyCard(b, p)).join('') }, 'grid'],
     claims: [(cursor) => q('accounts.claims', { address: addr, limit: 12, ...(cursor ? { cursor } : {}) }), async (items) => items.map(claimLink).join(''), 'claims'],
     nfts: [(cursor) => q('accounts.nfts', { address: addr, limit: 12, ...(cursor ? { cursor } : {}) }), async (items) => items.map(claimLink).join(''), 'claims'],
+    drafts: [(cursor) => fetch(`/api/bounty-drafts?creator=${addr}&offset=${cursor || 0}`).then((r) => r.json()).then((r) => ({ items: r.drafts || [], nextCursor: r.nextOffset })), async (items) => { const p = await price(); return items.map((d) => draftCard(d, p)).join('') }, 'grid'],
   }
   const show = (t) => {
     renderId++
@@ -1134,7 +1203,8 @@ async function route(params) {
     if ((m = path.match(/^\/(mainnet|arbitrum|base|degen)\/bounty\/(\d+)$/))) return await bountyPage(m[1], +m[2], params)
     if ((m = path.match(/^\/account\/([^/]+)$/))) return await account(m[1])
     if ((m = path.match(/^\/a\/([^/]+)$/))) return await album(m[1], params)
-    if (path === '/create') return await create()
+    if (path === '/create') return await create(params)
+    if ((m = path.match(/^\/d\/([a-z2-7]+)$/))) return await draftPage(m[1])
     if (path === '/me') {
       if (!state.account) await connect().catch(() => {})
       if (state.account) return go('/account/' + state.account, true)

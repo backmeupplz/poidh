@@ -252,6 +252,41 @@ async function uploaded(name: string) {
   })
 }
 
+// --- bounty drafts: JSON that poidh pins to IPFS (POST /api/bounty-drafts), shown at /d/<cid> --------
+// The CID is a raw-codec sha256 one, so the bytes are checked against it and kept forever.
+const DRAFTS = `${DATA}/drafts`
+mkdirSync(DRAFTS, { recursive: true })
+const B32 = 'abcdefghijklmnopqrstuvwxyz234567'
+function rawCid(bytes: Uint8Array) {
+  const b = [0x01, 0x55, 0x12, 0x20, ...new Bun.CryptoHasher('sha256').update(bytes).digest()]
+  let out = 'b', acc = 0, bits = 0
+  for (const x of b) for (acc = (acc << 8) | x, bits += 8; bits >= 5; bits -= 5) out += B32[(acc >>> (bits - 5)) & 31]
+  return bits ? out + B32[(acc << (5 - bits)) & 31] : out
+}
+type Draft = { creator: string; title: string; description: string; amount: string; chain: 'mainnet' | 'base' | 'arbitrum'; isOpenBounty: boolean; album: string; createdAt: string }
+async function draft(cid: string): Promise<Draft | null> {
+  if (!/^bafkrei[a-z2-7]{52}$/.test(cid)) return null
+  const file = Bun.file(`${DRAFTS}/${cid}.json`)
+  let bytes = (await file.exists()) ? await file.bytes() : undefined
+  if (!bytes) {
+    const r = await fetch(`https://gateway.pinata.cloud/ipfs/${cid}`, { redirect: 'error', signal: AbortSignal.timeout(12_000) })
+    if (!r.ok) throw new Error(`gateway ${r.status}`)
+    bytes = new Uint8Array(await r.arrayBuffer())
+    if (bytes.length > 30_000 || rawCid(bytes) !== cid) return null
+    await Bun.write(file, bytes)
+  }
+  const d = JSON.parse(new TextDecoder().decode(bytes))
+  const ok = d?.type === 'poidh-bounty-draft' && /^0x[0-9a-fA-F]{40}$/.test(d.creator) && typeof d.title === 'string' && typeof d.description === 'string' &&
+    /^\d+(\.\d{1,18})?$/.test(d.amount) && ['mainnet', 'base', 'arbitrum'].includes(d.chain) && typeof d.isOpenBounty === 'boolean' && typeof (d.album ?? '') === 'string'
+  return ok ? { ...d, creator: d.creator.toLowerCase(), album: d.album || '' } : null
+}
+async function draftJson(cid: string) {
+  const d = await draft(cid).catch(() => undefined)
+  if (d === undefined) return new Response('ipfs gateway error', { status: 502 })
+  if (!d) return new Response('not found', { status: 404 })
+  return Response.json(d, { headers: { 'cache-control': 'public, max-age=31536000, immutable' } })
+}
+
 // --- Farcaster mini app ----------------------------------------------------------
 const manifest = (origin: string) => ({
   ...(ASSOCIATION ? { accountAssociation: ASSOCIATION } : {}),
@@ -456,6 +491,21 @@ async function metaFor(req: Request, url: URL): Promise<Meta> {
       button: 'view profile',
     }
   }
+  if ((m = url.pathname.match(/^\/d\/([a-z2-7]+)\/?$/))) {
+    const d = await draft(m[1])
+    if (!d) return STATIC['/']
+    const [by, price] = await Promise.all([person(d.creator), get('web3.fetchPrice', { currency: 'eth' })])
+    return {
+      title: `${d.title} (draft) | poidh`,
+      desc: cut(`${d.amount} eth bounty draft, ready to post. ${clean(d.description)}`, 200),
+      card: {
+        title: cut(d.title, 140), by: `drafted by ${by.who}`, byPic: by.pic,
+        pills: [[d.chain === 'mainnet' ? 'ethereum' : d.chain], ['draft', RED]],
+        stats: [[`${d.amount} eth`, price ? `$${(+d.amount * price).toFixed(2)}` : 'bounty'], [d.isOpenBounty ? 'open' : 'solo', 'bounty']],
+      },
+      button: 'create this bounty',
+    }
+  }
   if ((m = url.pathname.match(/^\/a\/([^/]+)\/?$/))) {
     const album = decodeURIComponent(m[1]).toLowerCase().slice(0, 40)
     const c = await get('bounties.fetchAlbumCounts', { album })
@@ -502,6 +552,7 @@ Bun.serve({
     if (url.pathname.startsWith('/og/')) return cardImage(req, url)
     if (url.pathname === '/upload' && req.method === 'POST') return upload(req, url)
     if (url.pathname.startsWith('/u/')) return uploaded(url.pathname.slice(3))
+    if (url.pathname.startsWith('/draft/')) return draftJson(url.pathname.slice(7))
     if (url.pathname === '/.well-known/farcaster.json') return Response.json(manifest(url.origin), { headers: { 'access-control-allow-origin': '*' } })
     const a = assets.get(url.pathname)
     if (a && url.pathname !== '/index.html')
